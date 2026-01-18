@@ -18,31 +18,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 自动激活虚拟环境（可选）
-
-项目已包含 `.envrc` 文件，支持自动激活虚拟环境：
-
-**方法 1：使用 direnv（推荐）**
-```bash
-# 安装 direnv（如果还没有）
-brew install direnv  # macOS
-# 或 apt install direnv  # Linux
-
-# 在 ~/.zshrc 或 ~/.bashrc 中添加：
-eval "$(direnv hook zsh)"  # 或 eval "$(direnv hook bash)"
-
-# 允许当前目录的 .envrc
-direnv allow
-```
-
-之后每次进入此目录，虚拟环境会自动激活。
-
-**方法 2：手动激活**
-如果不想使用 direnv，每次进入目录时运行：
-```bash
-source .venv/bin/activate
-```
-
 > 说明：如果你不需要处理 `.xls`（老格式），可以不装 `xlrd`。
 
 ## 2) 运行（Web 界面）

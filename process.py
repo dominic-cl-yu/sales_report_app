@@ -22,13 +22,14 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, date, time
 from typing import Dict, List, Tuple, Optional, Any
 
 import pandas as pd
 
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import to_excel
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.worksheet.filters import AutoFilter, FilterColumn
@@ -432,14 +433,33 @@ def process_excel(
     xls: pd.ExcelFile,
     *,
     scan_rows: int = SCAN_ROWS_DEFAULT,
+    min_matched: int = 6,
+    footer_scan_rows: int = 300,
 ) -> pd.DataFrame:
+    """读取并清洗（合并为一张 DataFrame）。
+
+    优化点：
+    - 自动跳过 Summary/Benchmark 等非数据 sheet（依据表头匹配分数）
+    - 对于超大 sheet，只在末尾 N 行做“footer/note”清理，避免整表逐行 apply 造成耗时
+    """
     team_cache: Dict[str, str] = {}
     all_dfs: List[pd.DataFrame] = []
 
     for sheet in xls.sheet_names:
-        header_row, _, _ = detect_header_row(xls, sheet, scan_rows)
+        header_row, score, _matched = detect_header_row(xls, sheet, scan_rows)
+        if score < min_matched:
+            continue
+
         df = pd.read_excel(xls, sheet_name=sheet, header=header_row).dropna(how="all")
-        df = _drop_footer_note_rows(df)
+
+        # footer/note 清理（仅扫末尾，提高性能）
+        if len(df) > footer_scan_rows:
+            cut = max(0, len(df) - footer_scan_rows)
+            head = df.iloc[:cut]
+            tail = _drop_footer_note_rows(df.iloc[cut:])
+            df = pd.concat([head, tail], axis=0)
+        else:
+            df = _drop_footer_note_rows(df)
 
         sheet_upper = str(sheet).upper()
         if sheet_upper == "SO":
@@ -466,7 +486,15 @@ def process_excel(
 
         cleaned.insert(0, "_Sheet", sheet)
         cleaned = cleaned.loc[:, ~cleaned.columns.duplicated()]
-        cleaned = _remove_footer_rows(cleaned, sheet)
+
+        # footer 清理（仅扫末尾，提高性能）
+        if len(cleaned) > footer_scan_rows:
+            cut = max(0, len(cleaned) - footer_scan_rows)
+            head = cleaned.iloc[:cut]
+            tail = _remove_footer_rows(cleaned.iloc[cut:], sheet)
+            cleaned = pd.concat([head, tail], axis=0)
+        else:
+            cleaned = _remove_footer_rows(cleaned, sheet)
 
         if len(cleaned) > 0 and not cleaned.isna().all().all():
             all_dfs.append(cleaned)
@@ -480,6 +508,67 @@ def process_excel(
 # ======================
 # Pivot 生成
 # ======================
+
+
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    """将混合类型序列尽可能转为数值（用于 Pivot 计算）。
+
+    背景：部分 OSR 导出的 Excel 中，`Order Qty` 列会被错误套用“日期格式”，
+    pandas 读取后会变成 `datetime`（例如 1900-01-03）。
+    若直接 `pd.to_numeric` 会变成 NaN，导致透视表该月份全部为 0。
+
+    处理策略：
+    - datetime / Timestamp：转换回 Excel serial number（openpyxl 的 to_excel）
+    - time：换算为一天的比例（Excel 对时间的存储方式）
+    - 字符串：去掉逗号、空格、括号负数等常见格式后再 to_numeric
+    """
+    if s is None:
+        return pd.Series(dtype='float64')
+
+    # already numeric
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors='coerce')
+
+    ser = s.copy()
+
+    # datetime64 dtype (rare in object-mixed columns)
+    if pd.api.types.is_datetime64_any_dtype(ser):
+        out = ser.map(lambda x: to_excel(pd.Timestamp(x).to_pydatetime()) if pd.notna(x) else None)
+        return pd.to_numeric(out, errors='coerce')
+
+    # object dtype: handle datetime/date/time and string
+    # datetime / Timestamp
+    mask_dt = ser.map(lambda x: isinstance(x, (datetime, pd.Timestamp)))
+    if mask_dt.any():
+        ser.loc[mask_dt] = ser.loc[mask_dt].map(
+            lambda x: to_excel(x.to_pydatetime()) if isinstance(x, pd.Timestamp) else to_excel(x)
+        )
+
+    # date (without time)
+    mask_date = ser.map(lambda x: isinstance(x, date) and not isinstance(x, datetime))
+    if mask_date.any():
+        ser.loc[mask_date] = ser.loc[mask_date].map(
+            lambda d: to_excel(datetime.combine(d, datetime.min.time()))
+        )
+
+    # time -> fraction of day
+    mask_time = ser.map(lambda x: isinstance(x, time))
+    if mask_time.any():
+        ser.loc[mask_time] = ser.loc[mask_time].map(
+            lambda t: (t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6) / 86400
+        )
+
+    # strings cleaning
+    mask_str = ser.map(lambda x: isinstance(x, str))
+    if mask_str.any():
+        cleaned = ser.loc[mask_str].astype(str).str.strip()
+        cleaned = cleaned.str.replace(r'^\((.*)\)$', r'-\1', regex=True)
+        cleaned = cleaned.str.replace(',', '', regex=False)
+        cleaned = cleaned.str.replace(r'[^0-9eE\.\+\-]', '', regex=True)
+        ser.loc[mask_str] = cleaned
+
+    return pd.to_numeric(ser, errors='coerce')
+
 def generate_pivot_tables(
     df: pd.DataFrame,
     *,
@@ -494,7 +583,7 @@ def generate_pivot_tables(
     if value_col not in df.columns:
         df[value_col] = 0
 
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0)
+    df[value_col] = _coerce_numeric_series(df[value_col]).fillna(0)
     df["Customer Delivery Date"] = pd.to_datetime(df["Customer Delivery Date"], errors="coerce")
     df["MonthLabel"] = df["Customer Delivery Date"].dt.strftime("%b-%y")
 
@@ -749,7 +838,12 @@ def _write_factory_sheet_no_table(
     report_date: str,
     metric_label: str,
 ) -> bool:
-    """每个 Factory sheet：先写 ALL DATA 表，再按 Product Type + Team 拆分写多个表。"""
+    """每个 Factory sheet：
+
+    结构：
+    1) 顶部：ALL DATA 汇总表（All Teams + Product Types）
+    2) 下方：按 **Team -> Product Type** 拆分多个小表（满足“同 Team 聚在一起”的查看需求）
+    """
 
     # Build consolidated DataFrame for this factory
     parts: List[pd.DataFrame] = []
@@ -766,15 +860,18 @@ def _write_factory_sheet_no_table(
 
     factory_all_df = pd.concat(parts, ignore_index=True)
 
-    # Sort for readability
+    # Sort for readability (Team -> Product Type -> Order Type)
     if "Order Type" in factory_all_df.columns:
         factory_all_df["__sort_key"] = factory_all_df["Order Type"].map(ORDER_TYPE_SORT_ORDER).fillna(999)
+
         sort_cols: List[str] = []
-        for c in ("Product Type", "Team", "__sort_key"):
+        for c in ("Team", "Product Type", "__sort_key"):
             if c in factory_all_df.columns:
                 sort_cols.append(c)
+
         if sort_cols:
             factory_all_df = factory_all_df.sort_values(by=sort_cols, ascending=True)
+
         factory_all_df = factory_all_df.drop(columns=["__sort_key"], errors="ignore").reset_index(drop=True)
 
     current_row = 1
@@ -802,12 +899,14 @@ def _write_factory_sheet_no_table(
             allowed_filter_columns=["Team", "Order Type", "Product Type"],
         )
 
-        # Add spacing
+        # spacing
         current_row += 3
 
     # ----------------------
-    # Split tables
+    # Split tables (Team -> Product Type)
     # ----------------------
+    team_to_parts: Dict[str, List[Tuple[str, pd.DataFrame]]] = {}
+
     for product_type in sorted(pivot_tables.keys()):
         pivot_df = pivot_tables[product_type]
         if pivot_df is None or pivot_df.empty:
@@ -818,21 +917,41 @@ def _write_factory_sheet_no_table(
             continue
 
         team_series = factory_pt_df["Team"].fillna("").astype(str)
-        teams_in_order = [t for t in pd.unique(team_series) if str(t).strip() != ""]
-        if not teams_in_order:
-            teams_in_order = [""]
-
-        for team in teams_in_order:
+        for team in pd.unique(team_series):
             team_df = factory_pt_df.loc[team_series == team].copy()
             if team_df.empty:
                 continue
+            team_to_parts.setdefault(team, []).append((product_type, team_df))
 
+    team_order = {
+        "Sports": 0,
+        "Fancy": 1,
+        "SW": 2,
+        "Cotton Panty": 3,
+        "Brands-COS": 4,
+        "Brands-Stories": 5,
+    }
+
+    def _team_sort_key(t: str):
+        t_clean = str(t).strip()
+        if not t_clean:
+            return (2, 999, "")
+        if t_clean in team_order:
+            return (0, team_order[t_clean], t_clean)
+        return (1, 999, t_clean)
+
+    for team in sorted(team_to_parts.keys(), key=_team_sort_key):
+        parts_list = team_to_parts[team]
+        # within same team, sort by Product Type
+        parts_list_sorted = sorted(parts_list, key=lambda x: str(x[0]))
+
+        for product_type, team_df in parts_list_sorted:
             team_title = team if str(team).strip() else "（空）"
-            title_text = f"{factory_name} — {product_type} --- {team_title} ({metric_label})"
+            title_text = f"{factory_name} — {team_title} --- {product_type} ({metric_label})"
 
-            safe_pt = _sanitize_table_name(str(product_type))
             safe_team = _sanitize_table_name(str(team))
-            table_name = f"T_{safe_factory}_{safe_pt}_{safe_team}_{table_counter}"
+            safe_pt = _sanitize_table_name(str(product_type))
+            table_name = f"T_{safe_factory}_{safe_team}_{safe_pt}_{table_counter}"
             table_counter += 1
 
             current_row = _write_table_block(
@@ -849,7 +968,9 @@ def _write_factory_sheet_no_table(
 
             current_row += 3
 
+    # ----------------------
     # Column widths
+    # ----------------------
     max_col = max(ws.max_column, 1)
     for col_idx in range(1, max_col + 1):
         if col_idx == 1:
