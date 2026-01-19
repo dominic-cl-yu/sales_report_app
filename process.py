@@ -598,7 +598,10 @@ def generate_pivot_tables(
 
     product_types = sorted(df["Product Type"].dropna().unique())
     result: Dict[str, pd.DataFrame] = {}
-    base_cols = ["Factory", "Team", "Order Type", "Customer", "Product Type", "Date"]
+
+    # NOTE: 输出列顺序要求：Order Type 紧挨在 Team 的左侧（即：... Order Type, Team ...）。
+    # 这样在每个 Excel Table 中，筛选下拉的顺序也会按期望显示。
+    base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
 
     for pt in product_types:
         sub_df = df[df["Product Type"] == pt].copy()
@@ -614,6 +617,10 @@ def generate_pivot_tables(
             fill_value=0,
         )
         pivot = pivot.reindex(columns=all_months, fill_value=0).reset_index()
+
+        # 调整三大维度列顺序：Factory, Order Type, Team
+        # （保留后续 sort 的逻辑：仍然按 Factory -> Team -> Order Type 排序更易读）
+        pivot = pivot.reindex(columns=["Factory", "Order Type", "Team"] + [c for c in pivot.columns if c not in {"Factory", "Team", "Order Type"}])
 
         pivot["Customer"] = customer
         pivot["Product Type"] = pt
@@ -787,7 +794,8 @@ def _write_table_block(
 
     # Total row (SUBTOTAL)
     total_row_num = current_row
-    base_cols = ["Factory", "Team", "Order Type", "Customer", "Product Type", "Date"]
+    # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date
+    base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
     actual_month_cols = [
         c
         for c in df.columns
@@ -972,14 +980,15 @@ def _write_factory_sheet_no_table(
     # Column widths
     # ----------------------
     max_col = max(ws.max_column, 1)
+    # 输出列顺序已调整为：Factory, Order Type, Team, Customer, Product Type, Date, ...
     for col_idx in range(1, max_col + 1):
-        if col_idx == 1:
+        if col_idx == 1:  # Factory
             ws.column_dimensions[get_column_letter(col_idx)].width = 12
-        elif col_idx == 2:
-            ws.column_dimensions[get_column_letter(col_idx)].width = 22
-        elif col_idx == 3:
+        elif col_idx == 2:  # Order Type
             ws.column_dimensions[get_column_letter(col_idx)].width = 14
-        elif col_idx in (4, 5, 6):
+        elif col_idx == 3:  # Team
+            ws.column_dimensions[get_column_letter(col_idx)].width = 22
+        elif col_idx in (4, 5, 6):  # Customer / Product Type / Date
             ws.column_dimensions[get_column_letter(col_idx)].width = 14
         else:
             ws.column_dimensions[get_column_letter(col_idx)].width = 11
