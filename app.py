@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, date
 
 import streamlit as st
 
@@ -49,23 +49,73 @@ def main() -> None:
         st.info("请选择并上传一个 Excel 文件。")
         return
 
-    # 新文件：清理缓存，并固定一次报表日期
+    def _set_report_date(d: date) -> None:
+        """统一维护报表日期（date 对象），并同步到 date picker 的 widget state。"""
+        st.session_state["report_date_obj"] = d
+        st.session_state["report_date_picker"] = d
+
+    def _reset_report_date_to_today() -> None:
+        _set_report_date(datetime.now().date())
+
+    # 新文件：清理缓存，并把“报表日期”重置为今天（允许用户再自定义）
     if st.session_state.get("uploaded_name") != uploaded.name:
         st.session_state.pop("pivot_bytes", None)
         st.session_state.pop("stats", None)
         st.session_state["uploaded_name"] = uploaded.name
-        st.session_state["auto_report_date"] = datetime.now().strftime("%b-%d")
+        _reset_report_date_to_today()
 
     base_name = os.path.splitext(uploaded.name)[0]
     ext = os.path.splitext(uploaded.name)[1].lower()
 
-    report_date = st.session_state.get("auto_report_date") or datetime.now().strftime("%b-%d")
+    # 统一以 date 对象存储（方便 date picker），在真正写入报表时再格式化为 "Jan-19" 这种字符串
+    report_date_obj: date = st.session_state.get("report_date_obj") or datetime.now().date()
+    report_date = report_date_obj.strftime("%b-%d")
 
-    c1, c2 = st.columns([1, 1])
+    # 如果用户更改了报表日期，则让之前生成的文件失效，避免“日期已变但仍下载旧文件”的误解
+    if "pivot_bytes" in st.session_state:
+        last_gen = st.session_state.get("generated_report_date")
+        if last_gen and last_gen != report_date:
+            st.session_state.pop("pivot_bytes", None)
+            st.session_state.pop("stats", None)
+            st.session_state.pop("generated_report_date", None)
+            st.info("你已更改报表日期，请重新点击“生成报表”以应用新日期。")
+
+    c1, c2, c3 = st.columns([1, 1, 0.7])
     with c1:
         run_btn = st.button("生成报表", type="primary", use_container_width=True)
     with c2:
-        st.text_input("报表日期（自动）", value=report_date, disabled=True)
+        st.text_input("报表日期", value=report_date, disabled=True)
+    with c3:
+        # Streamlit 的 date_input 自带日历选择器，默认打开当前月份，可切换月份
+        # 为了满足“按按钮弹出日历”的体验：优先用 popover（若版本不支持则降级为 expander）
+        if hasattr(st, "popover"):
+            with st.popover("选择日期"):
+                picked = st.date_input(
+                    "选择报表日期",
+                    value=report_date_obj,
+                    key="report_date_picker",
+                )
+                # 把 widget 结果同步到真正用于生成报表的 key
+                st.session_state["report_date_obj"] = picked
+
+                st.button(
+                    "重置为今天",
+                    on_click=_reset_report_date_to_today,
+                    use_container_width=True,
+                )
+        else:
+            with st.expander("选择日期", expanded=False):
+                picked = st.date_input(
+                    "选择报表日期",
+                    value=report_date_obj,
+                    key="report_date_picker",
+                )
+                st.session_state["report_date_obj"] = picked
+                st.button(
+                    "重置为今天",
+                    on_click=_reset_report_date_to_today,
+                    use_container_width=True,
+                )
 
     if run_btn:
         excel_bytes = uploaded.getvalue()
@@ -83,6 +133,7 @@ def main() -> None:
 
                 st.session_state["pivot_bytes"] = pivot_bytes
                 st.session_state["stats"] = stats
+                st.session_state["generated_report_date"] = report_date
 
                 status.update(label="处理完成", state="complete")
 
