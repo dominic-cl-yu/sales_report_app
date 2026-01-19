@@ -21,7 +21,7 @@ import io
 import os
 import re
 import tempfile
-import time
+import time as time_mod
 from datetime import datetime, date, time
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -792,8 +792,14 @@ def _write_table_block(
 
     ws.add_table(table)
 
-    # Total row (SUBTOTAL)
+    # Total row (pre-calculated values)
+    # NOTE:
+    # - openpyxl 不会计算公式，也不会写入公式的缓存结果；
+    #   因此若使用 SUBTOTAL 等公式，部分预览器/未自动重算的 Excel 可能显示为空，
+    #   造成“Total 行/Total 数值丢失”的观感。
+    # - 这里改为：在 Python 端直接汇总并写入数值，确保打开即有结果。
     total_row_num = current_row
+
     # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date
     base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
     actual_month_cols = [
@@ -801,6 +807,16 @@ def _write_table_block(
         for c in df.columns
         if c not in base_cols and c not in ["2025 Ttl", "2026 Ttl", "Ttl"]
     ]
+
+    def _sum_numeric(col: str) -> float:
+        """安全求和：优先走数值 dtype；否则尝试转数值后求和。"""
+        if col not in df.columns:
+            return 0.0
+        ser = df[col]
+        if pd.api.types.is_numeric_dtype(ser):
+            return float(ser.fillna(0).sum())
+        s = pd.to_numeric(ser, errors="coerce").fillna(0)
+        return float(s.sum())
 
     for c_idx, col_name in enumerate(df.columns, start=1):
         cell = ws.cell(row=total_row_num, column=c_idx)
@@ -824,13 +840,13 @@ def _write_table_block(
             elif col_name == "Order Type":
                 cell.value = "Total"
 
-        elif col_name in actual_month_cols:
-            col_letter = get_column_letter(c_idx)
-            cell.value = f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{last_data_row})"
-
-        elif col_name in ("2025 Ttl", "2026 Ttl", "Ttl"):
-            col_letter = get_column_letter(c_idx)
-            cell.value = f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{last_data_row})"
+        elif col_name in actual_month_cols or col_name in ("2025 Ttl", "2026 Ttl", "Ttl"):
+            total_val = _sum_numeric(col_name)
+            # 如果是整数（如 Order Qty），尽量写成 int，避免出现 1234.0
+            if abs(total_val - round(total_val)) < 1e-9:
+                cell.value = int(round(total_val))
+            else:
+                cell.value = total_val
 
         else:
             cell.value = 0
@@ -1041,7 +1057,7 @@ def _safe_remove(path: str, retries: int = 12, delay_s: float = 0.15) -> None:
         except FileNotFoundError:
             return
         except PermissionError:
-            time.sleep(delay_s)
+            time_mod.sleep(delay_s)
     try:
         os.remove(path)
     except Exception:
