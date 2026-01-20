@@ -1,11 +1,12 @@
-# app.py
 # -*- coding: utf-8 -*-
 """简体中文 Streamlit 界面：销售透视报表生成器
 
 运行：
     streamlit run app.py
 
-依赖：见 requirements.txt
+说明：
+- 生成的 Pivot 报表 Total 行使用 SUBTOTAL(109,...) 公式，
+  在 Excel 里筛选/隐藏行时会自动跟随变化。
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ def main() -> None:
 - 不需要手动选择表头/列名：系统会自动扫描并匹配。
 - Team 会按规则自动归类（如 SW / Sports / Fancy 等）。
 - Customer 字段固定写入 `ALL`。
+- Total 行使用 `SUBTOTAL(109, ...)`，筛选后会自动更新。
             """
         )
 
@@ -65,7 +67,6 @@ def main() -> None:
         _reset_report_date_to_today()
 
     base_name = os.path.splitext(uploaded.name)[0]
-    ext = os.path.splitext(uploaded.name)[1].lower()
 
     # 统一以 date 对象存储（方便 date picker），在真正写入报表时再格式化为 "Jan-19" 这种字符串
     report_date_obj: date = st.session_state.get("report_date_obj") or datetime.now().date()

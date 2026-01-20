@@ -1,6 +1,9 @@
-# process.py
 # -*- coding: utf-8 -*-
 """销售透视报表处理核心（无 UI）
+
+目标（按你的最新要求）：
+- 保留当前报表的版式/标题/列顺序等“NEW 的改动”
+- 恢复 Total 行为 Excel 公式：=SUBTOTAL(109,...)（可随筛选动态变化）
 
 功能：
 - 读取订单状态 Excel（支持多 sheet，自动识别表头）
@@ -509,7 +512,6 @@ def process_excel(
 # Pivot 生成
 # ======================
 
-
 def _coerce_numeric_series(s: pd.Series) -> pd.Series:
     """将混合类型序列尽可能转为数值（用于 Pivot 计算）。
 
@@ -519,55 +521,50 @@ def _coerce_numeric_series(s: pd.Series) -> pd.Series:
 
     处理策略：
     - datetime / Timestamp：转换回 Excel serial number（openpyxl 的 to_excel）
+    - date：按 00:00:00 组合成 datetime 再转 serial
     - time：换算为一天的比例（Excel 对时间的存储方式）
     - 字符串：去掉逗号、空格、括号负数等常见格式后再 to_numeric
     """
     if s is None:
-        return pd.Series(dtype='float64')
+        return pd.Series(dtype="float64")
 
-    # already numeric
     if pd.api.types.is_numeric_dtype(s):
-        return pd.to_numeric(s, errors='coerce')
+        return pd.to_numeric(s, errors="coerce")
 
     ser = s.copy()
 
-    # datetime64 dtype (rare in object-mixed columns)
     if pd.api.types.is_datetime64_any_dtype(ser):
         out = ser.map(lambda x: to_excel(pd.Timestamp(x).to_pydatetime()) if pd.notna(x) else None)
-        return pd.to_numeric(out, errors='coerce')
+        return pd.to_numeric(out, errors="coerce")
 
-    # object dtype: handle datetime/date/time and string
-    # datetime / Timestamp
     mask_dt = ser.map(lambda x: isinstance(x, (datetime, pd.Timestamp)))
     if mask_dt.any():
         ser.loc[mask_dt] = ser.loc[mask_dt].map(
             lambda x: to_excel(x.to_pydatetime()) if isinstance(x, pd.Timestamp) else to_excel(x)
         )
 
-    # date (without time)
     mask_date = ser.map(lambda x: isinstance(x, date) and not isinstance(x, datetime))
     if mask_date.any():
         ser.loc[mask_date] = ser.loc[mask_date].map(
             lambda d: to_excel(datetime.combine(d, datetime.min.time()))
         )
 
-    # time -> fraction of day
     mask_time = ser.map(lambda x: isinstance(x, time))
     if mask_time.any():
         ser.loc[mask_time] = ser.loc[mask_time].map(
             lambda t: (t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6) / 86400
         )
 
-    # strings cleaning
     mask_str = ser.map(lambda x: isinstance(x, str))
     if mask_str.any():
         cleaned = ser.loc[mask_str].astype(str).str.strip()
-        cleaned = cleaned.str.replace(r'^\((.*)\)$', r'-\1', regex=True)
-        cleaned = cleaned.str.replace(',', '', regex=False)
-        cleaned = cleaned.str.replace(r'[^0-9eE\.\+\-]', '', regex=True)
+        cleaned = cleaned.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+        cleaned = cleaned.str.replace(",", "", regex=False)
+        cleaned = cleaned.str.replace(r"[^0-9eE\.\+\-]", "", regex=True)
         ser.loc[mask_str] = cleaned
 
-    return pd.to_numeric(ser, errors='coerce')
+    return pd.to_numeric(ser, errors="coerce")
+
 
 def generate_pivot_tables(
     df: pd.DataFrame,
@@ -599,8 +596,7 @@ def generate_pivot_tables(
     product_types = sorted(df["Product Type"].dropna().unique())
     result: Dict[str, pd.DataFrame] = {}
 
-    # NOTE: 输出列顺序要求：Order Type 紧挨在 Team 的左侧（即：... Order Type, Team ...）。
-    # 这样在每个 Excel Table 中，筛选下拉的顺序也会按期望显示。
+    # 输出列顺序要求：Order Type 紧挨在 Team 的左侧
     base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
 
     for pt in product_types:
@@ -619,8 +615,10 @@ def generate_pivot_tables(
         pivot = pivot.reindex(columns=all_months, fill_value=0).reset_index()
 
         # 调整三大维度列顺序：Factory, Order Type, Team
-        # （保留后续 sort 的逻辑：仍然按 Factory -> Team -> Order Type 排序更易读）
-        pivot = pivot.reindex(columns=["Factory", "Order Type", "Team"] + [c for c in pivot.columns if c not in {"Factory", "Team", "Order Type"}])
+        pivot = pivot.reindex(
+            columns=["Factory", "Order Type", "Team"]
+            + [c for c in pivot.columns if c not in {"Factory", "Team", "Order Type"}]
+        )
 
         pivot["Customer"] = customer
         pivot["Product Type"] = pt
@@ -792,12 +790,7 @@ def _write_table_block(
 
     ws.add_table(table)
 
-    # Total row (pre-calculated values)
-    # NOTE:
-    # - openpyxl 不会计算公式，也不会写入公式的缓存结果；
-    #   因此若使用 SUBTOTAL 等公式，部分预览器/未自动重算的 Excel 可能显示为空，
-    #   造成“Total 行/Total 数值丢失”的观感。
-    # - 这里改为：在 Python 端直接汇总并写入数值，确保打开即有结果。
+    # Total row (SUBTOTAL formulas)
     total_row_num = current_row
 
     # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date
@@ -807,16 +800,6 @@ def _write_table_block(
         for c in df.columns
         if c not in base_cols and c not in ["2025 Ttl", "2026 Ttl", "Ttl"]
     ]
-
-    def _sum_numeric(col: str) -> float:
-        """安全求和：优先走数值 dtype；否则尝试转数值后求和。"""
-        if col not in df.columns:
-            return 0.0
-        ser = df[col]
-        if pd.api.types.is_numeric_dtype(ser):
-            return float(ser.fillna(0).sum())
-        s = pd.to_numeric(ser, errors="coerce").fillna(0)
-        return float(s.sum())
 
     for c_idx, col_name in enumerate(df.columns, start=1):
         cell = ws.cell(row=total_row_num, column=c_idx)
@@ -841,12 +824,8 @@ def _write_table_block(
                 cell.value = "Total"
 
         elif col_name in actual_month_cols or col_name in ("2025 Ttl", "2026 Ttl", "Ttl"):
-            total_val = _sum_numeric(col_name)
-            # 如果是整数（如 Order Qty），尽量写成 int，避免出现 1234.0
-            if abs(total_val - round(total_val)) < 1e-9:
-                cell.value = int(round(total_val))
-            else:
-                cell.value = total_val
+            col_letter = get_column_letter(c_idx)
+            cell.value = f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{last_data_row})"
 
         else:
             cell.value = 0
@@ -866,7 +845,7 @@ def _write_factory_sheet_no_table(
 
     结构：
     1) 顶部：ALL DATA 汇总表（All Teams + Product Types）
-    2) 下方：按 **Team -> Product Type** 拆分多个小表（满足“同 Team 聚在一起”的查看需求）
+    2) 下方：按 **Team -> Product Type** 拆分多个小表（同 Team 聚在一起）
     """
 
     # Build consolidated DataFrame for this factory
@@ -906,7 +885,8 @@ def _write_factory_sheet_no_table(
     # Consolidated ALL DATA
     # ----------------------
     if not factory_all_df.empty:
-        title_text = f"{factory_name} --- {metric_label} --- ALL (All Teams + Product Types)"
+        # 标题遵循 NEW 的格式：Factory — ALL --- Metric (All Teams + Product Types)
+        title_text = f"{factory_name} — ALL --- {metric_label} (All Teams + Product Types)"
         table_name = f"T_{safe_factory}_ALL_{table_counter}"
         table_counter += 1
 
@@ -923,7 +903,6 @@ def _write_factory_sheet_no_table(
             allowed_filter_columns=["Team", "Order Type", "Product Type"],
         )
 
-        # spacing
         current_row += 3
 
     # ----------------------
@@ -966,12 +945,12 @@ def _write_factory_sheet_no_table(
 
     for team in sorted(team_to_parts.keys(), key=_team_sort_key):
         parts_list = team_to_parts[team]
-        # within same team, sort by Product Type
         parts_list_sorted = sorted(parts_list, key=lambda x: str(x[0]))
 
         for product_type, team_df in parts_list_sorted:
             team_title = team if str(team).strip() else "（空）"
-            title_text = f"{factory_name} --- {team_title} --- {product_type} ({metric_label})"
+            # 标题遵循 NEW 的格式：Factory — Team --- Product Type (Metric)
+            title_text = f"{factory_name} — {team_title} --- {product_type} ({metric_label})"
 
             safe_team = _sanitize_table_name(str(team))
             safe_pt = _sanitize_table_name(str(product_type))
@@ -996,7 +975,7 @@ def _write_factory_sheet_no_table(
     # Column widths
     # ----------------------
     max_col = max(ws.max_column, 1)
-    # 输出列顺序已调整为：Factory, Order Type, Team, Customer, Product Type, Date, ...
+    # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date, ...
     for col_idx in range(1, max_col + 1):
         if col_idx == 1:  # Factory
             ws.column_dimensions[get_column_letter(col_idx)].width = 12
@@ -1078,6 +1057,7 @@ def pivot_report_multi_to_xlsx_bytes_no_table(
                 _write_workbook_no_table(writer, pivot_tables, report_date, metric_label)
 
             wb = writer.book
+            # 确保公式（SUBTOTAL 等）在打开时自动重算
             try:
                 wb.calculation.calcMode = "auto"
                 wb.calculation.fullCalcOnLoad = True
