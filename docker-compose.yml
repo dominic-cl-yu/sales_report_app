@@ -1,0 +1,50 @@
+# =============================================================================
+# Sales Pivot Report Generator - Docker Compose
+# =============================================================================
+# Usage:
+#   docker-compose up -d        # Start in background
+#   docker-compose down         # Stop and remove
+#   docker-compose logs -f      # View logs
+#   docker-compose build        # Rebuild image
+# =============================================================================
+
+services:
+  sales-report-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sales-report-app:latest
+    container_name: sales-report-app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      # Streamlit settings (can override defaults)
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      # Timezone (optional)
+      - TZ=Asia/Hong_Kong
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits (adjust based on your server)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    # Read-only root filesystem (optional, uncomment if needed)
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
