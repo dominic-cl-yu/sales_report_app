@@ -728,6 +728,7 @@ def _write_table_block(
     total_team_label: str = "Total",
     total_product_type_label: str = "ALL",
     allowed_filter_columns: Optional[List[str]] = None,
+    highlight_columns: Optional[List[str]] = None,
 ) -> int:
     """写入一个表块（标题 + 表头 + 数据 + Total 行），返回下一可用行。"""
     if df.empty:
@@ -752,6 +753,14 @@ def _write_table_block(
     for c_idx in range(1, num_cols + 1):
         ws.cell(row=header_row, column=c_idx).font = Font(bold=True)
     _format_headers_in_range(ws, header_row, num_cols)
+
+    # Optional: highlight some columns (header)
+    highlight_cols = [c for c in (highlight_columns or []) if c in df.columns]
+    highlight_col_idx = [df.columns.get_loc(c) + 1 for c in highlight_cols]
+    highlight_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    for col_idx in highlight_col_idx:
+        ws.cell(row=header_row, column=col_idx).fill = highlight_fill
+
     current_row += 1
 
     # Data rows
@@ -760,6 +769,12 @@ def _write_table_block(
         ws.append(row)
     last_data_row = data_start_row + len(df) - 1
     current_row = last_data_row + 1
+
+    # Optional: highlight some columns (data rows)
+    if highlight_col_idx:
+        for r in range(data_start_row, last_data_row + 1):
+            for col_idx in highlight_col_idx:
+                ws.cell(row=r, column=col_idx).fill = highlight_fill
 
     # Create Excel Table for header + data rows only (excludes Total row)
     table_ref = f"A{header_row}:{end_col_letter}{last_data_row}"
@@ -830,8 +845,72 @@ def _write_table_block(
         else:
             cell.value = 0
 
+    # Optional: highlight some columns (total row)
+    if highlight_col_idx:
+        for col_idx in highlight_col_idx:
+            ws.cell(row=total_row_num, column=col_idx).fill = highlight_fill
+
     current_row += 1
     return current_row
+
+
+def _build_order_type_summary_df(
+    factory_all_df: pd.DataFrame,
+    *,
+    report_date: str,
+    factory_name: str,
+) -> pd.DataFrame:
+    """按 Order Type 汇总（不含 Team/Customer/Product Type）用于每个 sheet 的首表。
+
+    目标样式参考邮件截图：
+    - 列：Factory | Order Type | Date | (Months...) | 2025 Ttl | 2026 Ttl | Ttl
+    - 行：SO / AO / Forecast-FR + (Total 行由 Excel SUBTOTAL 公式生成)
+    """
+
+    if factory_all_df is None or factory_all_df.empty:
+        return pd.DataFrame()
+
+    # 明细表固定列（其余列视为月份列）
+    detail_base_cols = {"Factory", "Order Type", "Team", "Customer", "Product Type", "Date"}
+    ttl_cols = [c for c in ["2025 Ttl", "2026 Ttl", "Ttl"] if c in factory_all_df.columns]
+    month_cols = [
+        c
+        for c in factory_all_df.columns
+        if c not in detail_base_cols and c not in set(ttl_cols)
+    ]
+
+    numeric_cols = month_cols + ttl_cols
+
+    # groupby 前先保证数值列可求和
+    work = factory_all_df.copy()
+    for c in numeric_cols:
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+
+    grouped = (
+        work.groupby(["Factory", "Order Type"], as_index=False)[numeric_cols]
+        .sum()
+        .copy()
+    )
+
+    # 确保 3 个 Order Type 都存在（若缺失则补 0）
+    wanted_order_types = ["SO", "AO", "Forecast-FR"]
+    rows: List[Dict[str, Any]] = []
+    for ot in wanted_order_types:
+        sub = grouped[grouped["Order Type"] == ot]
+        if sub.empty:
+            row: Dict[str, Any] = {"Factory": factory_name, "Order Type": ot}
+            for c in numeric_cols:
+                row[c] = 0
+            rows.append(row)
+        else:
+            rows.append(sub.iloc[0].to_dict())
+
+    summary = pd.DataFrame(rows)
+    summary["Date"] = report_date
+
+    ordered_cols = ["Factory", "Order Type", "Date"] + month_cols + ttl_cols
+    ordered_cols = [c for c in ordered_cols if c in summary.columns]
+    return summary[ordered_cols]
 
 
 def _write_factory_sheet_no_table(
@@ -844,8 +923,9 @@ def _write_factory_sheet_no_table(
     """每个 Factory sheet：
 
     结构：
-    1) 顶部：ALL DATA 汇总表（All Teams + Product Types）
-    2) 下方：按 **Team -> Product Type** 拆分多个小表（同 Team 聚在一起）
+    1) 顶部：Order Type 汇总表（不含 Team/Customer/Product Type）——邮件截图要求
+    2) 其次：ALL DATA 明细表（All Teams + Product Types）
+    3) 下方：按 **Team -> Product Type** 拆分多个小表（同 Team 聚在一起）
     """
 
     # Build consolidated DataFrame for this factory
@@ -882,11 +962,40 @@ def _write_factory_sheet_no_table(
     safe_factory = _sanitize_table_name(factory_name)
 
     # ----------------------
+    # NEW: Summary by Order Type (no Team/Customer/Product Type)
+    # ----------------------
+    summary_df = _build_order_type_summary_df(
+        factory_all_df,
+        report_date=report_date,
+        factory_name=factory_name,
+    )
+
+    if not summary_df.empty:
+        # 标题按截图：Factory — ALL --- Metric (All Teams + Product Types)
+        title_text = f"{factory_name} — ALL --- {metric_label} (All Teams + Product Types)"
+        table_name = f"T_{safe_factory}_SUMMARY_{table_counter}"
+        table_counter += 1
+
+        current_row = _write_table_block(
+            ws,
+            summary_df,
+            title_text,
+            current_row,
+            report_date,
+            factory_name,
+            table_name,
+            allowed_filter_columns=["Factory", "Order Type", "Date"],
+            highlight_columns=["Factory", "Order Type", "Date"],
+        )
+
+        current_row += 3
+
+    # ----------------------
     # Consolidated ALL DATA
     # ----------------------
     if not factory_all_df.empty:
-        # 标题遵循 NEW 的格式：Factory — ALL --- Metric (All Teams + Product Types)
-        title_text = f"{factory_name} — ALL --- {metric_label} (All Teams + Product Types)"
+        # 明细表（保留原有表，不删除）。为了避免与 Summary 标题混淆，加 "Detail" 后缀
+        title_text = f"{factory_name} — ALL --- {metric_label} (All Teams + Product Types) - Detail"
         table_name = f"T_{safe_factory}_ALL_{table_counter}"
         table_counter += 1
 
