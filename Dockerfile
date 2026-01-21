@@ -14,7 +14,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STREAMLIT_SERVER_ENABLECORS=false \
     STREAMLIT_SERVER_ENABLEXSRSFPROTECTION=false
 
-WORKDIR /app
+# IMPORTANT: Portainer URL build is using /build as the working folder
+WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -25,11 +26,9 @@ COPY requirements-docker.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-docker.txt
 
-# Copy all code in one go (safer than listing files)
-COPY . .
-
-RUN useradd --create-home appuser && chown -R appuser:appuser /app
-USER appuser
+# Copy your app code explicitly
+COPY app.py .
+COPY process.py .
 
 EXPOSE 8501
 
