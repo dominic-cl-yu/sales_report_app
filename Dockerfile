@@ -1,5 +1,5 @@
 # =============================================================================
-# Sales Pivot Report Generator - Dockerfile (Portainer URL build from GitHub tar.gz)
+# Sales Pivot Report Generator - Dockerfile (Portainer Upload build)
 # =============================================================================
 FROM python:3.11-slim
 
@@ -17,32 +17,34 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STREAMLIT_SERVER_ENABLECORS=false \
     STREAMLIT_SERVER_ENABLEXSRSFPROTECTION=false
 
-# Portainer URL build drops the extracted archive into the build context.
-# We copy everything to /build, then "cd" into the extracted repo folder at runtime.
+# Portainer Upload build context root
 WORKDIR /build
 
-# System deps (curl used by HEALTHCHECK)
+# System dependencies + CA certificates (IMPORTANT for corporate SSL)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the entire build context (GitHub tar.gz extracted contents)
+# Copy entire uploaded build context
 COPY . /build
 
-# Install Python dependencies from the extracted repo folder.
-# This finds the first directory that contains requirements-docker.txt.
+# Install Python dependencies
+# - Detect repo directory dynamically
+# - DO NOT upgrade pip (avoids SSL MITM failure)
 RUN set -eux; \
     REPO_DIR="$(find /build -maxdepth 2 -type f -name requirements-docker.txt -printf '%h\n' | head -n 1)"; \
     echo "Detected repo dir: ${REPO_DIR}"; \
-    python -m pip install --no-cache-dir --upgrade pip; \
     python -m pip install --no-cache-dir -r "${REPO_DIR}/requirements-docker.txt"; \
     echo "${REPO_DIR}" > /build/_repo_dir.txt
 
 EXPOSE 8501
 
+# Streamlit health endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
   CMD curl --fail http://127.0.0.1:8501/_stcore/health || exit 1
 
-# Start Streamlit from the detected repo folder (where app.py lives)
+# Start Streamlit from the detected repo folder
 CMD ["sh", "-c", "cd \"$(cat /build/_repo_dir.txt)\" && exec streamlit run app.py --server.address=0.0.0.0 --server.port=8501"]
