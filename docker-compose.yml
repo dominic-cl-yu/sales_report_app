@@ -9,15 +9,17 @@
 # =============================================================================
 
 services:
-  sales-report-app:
+  sales-report-app-QA:
     build:
       context: .
       dockerfile: Dockerfile
     image: sales-report-app:latest
     container_name: sales-report-app
     restart: unless-stopped
-    ports:
-      - "8501:8501"
+    expose:
+       - "8501"
+    # ports:
+    #  - "8501:8501"
     environment:
       # Streamlit settings (can override defaults)
       - STREAMLIT_SERVER_PORT=8501
