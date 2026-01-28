@@ -13,7 +13,7 @@ pool:
 
 variables:
   imageName: 'sales_report_app'
-  tag: '$(Build.BuildId)'
+  tag: $[ format('{0:yyyyMMddHHmm}', pipeline.startTime) ]
 
 steps:
 - task: Docker@2
