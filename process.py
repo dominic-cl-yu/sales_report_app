@@ -581,13 +581,16 @@ def generate_pivot_tables(
         df[value_col] = 0
 
     df[value_col] = _coerce_numeric_series(df[value_col]).fillna(0)
-    df["Customer Delivery Date"] = pd.to_datetime(df["Customer Delivery Date"], errors="coerce")
-    df["MonthLabel"] = df["Customer Delivery Date"].dt.strftime("%b-%y")
+    
+    # Use "Request Garment Delivery (DeadLine ex-fty)" for month grouping
+    date_col = "Request Garment Delivery (DeadLine ex-fty)"
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df["MonthLabel"] = df[date_col].dt.strftime("%b-%y")
 
     df["Order Type"] = df["Order Type"].replace({"FR": "Forecast-FR"})
 
-    min_date = df["Customer Delivery Date"].min()
-    max_date = df["Customer Delivery Date"].max()
+    min_date = df[date_col].min()
+    max_date = df[date_col].max()
     if pd.notna(min_date) and pd.notna(max_date):
         all_months = pd.date_range(min_date, max_date, freq="MS").strftime("%b-%y").tolist()
     else:
@@ -624,17 +627,25 @@ def generate_pivot_tables(
         pivot["Product Type"] = pt
         pivot["Date"] = report_date
 
-        month_2025 = [c for c in all_months if str(c).endswith("-25")]
-        month_2026 = [c for c in all_months if str(c).endswith("-26")]
-        pivot["2025 Ttl"] = pivot[month_2025].sum(axis=1) if month_2025 else 0
-        pivot["2026 Ttl"] = pivot[month_2026].sum(axis=1) if month_2026 else 0
-        pivot["Ttl"] = pivot["2025 Ttl"] + pivot["2026 Ttl"]
+        # Dynamically detect years from month columns (e.g., "Jan-25" -> 2025)
+        year_suffixes = sorted(set(
+            m.split("-")[1] for m in all_months if "-" in m
+        ))
+        year_ttl_cols = []
+        for ys in year_suffixes:
+            year_full = f"20{ys}"
+            month_cols_for_year = [c for c in all_months if str(c).endswith(f"-{ys}")]
+            col_name = f"{year_full} Ttl"
+            pivot[col_name] = pivot[month_cols_for_year].sum(axis=1) if month_cols_for_year else 0
+            year_ttl_cols.append(col_name)
+        
+        pivot["Ttl"] = pivot[year_ttl_cols].sum(axis=1) if year_ttl_cols else 0
 
         pivot["__sort_key"] = pivot["Order Type"].map(ORDER_TYPE_SORT_ORDER).fillna(999)
         pivot = pivot.sort_values(by=["Factory", "Team", "__sort_key"], ascending=[True, True, True])
         pivot = pivot.drop(columns=["__sort_key"])
 
-        final_cols = base_cols + all_months + ["2025 Ttl", "2026 Ttl", "Ttl"]
+        final_cols = base_cols + all_months + year_ttl_cols + ["Ttl"]
         pivot = pivot[[c for c in final_cols if c in pivot.columns]]
         result[pt] = pivot
 
@@ -659,11 +670,19 @@ def generate_pivot_tables(
         cols_to_drop = set(all_months) - set(trimmed_months)
         pivot = pivot.drop(columns=cols_to_drop, errors="ignore")
 
-        current_2025 = [c for c in trimmed_months if str(c).endswith("-25")]
-        current_2026 = [c for c in trimmed_months if str(c).endswith("-26")]
-        pivot["2025 Ttl"] = pivot[current_2025].sum(axis=1) if current_2025 else 0
-        pivot["2026 Ttl"] = pivot[current_2026].sum(axis=1) if current_2026 else 0
-        pivot["Ttl"] = pivot["2025 Ttl"] + pivot["2026 Ttl"]
+        # Recalculate dynamic year totals after trimming
+        year_suffixes = sorted(set(
+            m.split("-")[1] for m in trimmed_months if "-" in m
+        ))
+        year_ttl_cols = []
+        for ys in year_suffixes:
+            year_full = f"20{ys}"
+            month_cols_for_year = [c for c in trimmed_months if str(c).endswith(f"-{ys}")]
+            col_name = f"{year_full} Ttl"
+            pivot[col_name] = pivot[month_cols_for_year].sum(axis=1) if month_cols_for_year else 0
+            year_ttl_cols.append(col_name)
+        
+        pivot["Ttl"] = pivot[year_ttl_cols].sum(axis=1) if year_ttl_cols else 0
 
         result[pt] = pivot
 
@@ -810,10 +829,14 @@ def _write_table_block(
 
     # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date
     base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
+    
+    # Detect year total columns dynamically (e.g., "2024 Ttl", "2025 Ttl", "2026 Ttl", "2027 Ttl")
+    year_ttl_cols = [c for c in df.columns if c.endswith(" Ttl") and c != "Ttl"]
+    
     actual_month_cols = [
         c
         for c in df.columns
-        if c not in base_cols and c not in ["2025 Ttl", "2026 Ttl", "Ttl"]
+        if c not in base_cols and c not in set(year_ttl_cols) and c != "Ttl"
     ]
 
     for c_idx, col_name in enumerate(df.columns, start=1):
@@ -838,7 +861,7 @@ def _write_table_block(
             elif col_name == "Order Type":
                 cell.value = "Total"
 
-        elif col_name in actual_month_cols or col_name in ("2025 Ttl", "2026 Ttl", "Ttl"):
+        elif col_name in actual_month_cols or col_name in year_ttl_cols or col_name == "Ttl":
             col_letter = get_column_letter(c_idx)
             cell.value = f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{last_data_row})"
 
@@ -872,7 +895,11 @@ def _build_order_type_summary_df(
 
     # 明细表固定列（其余列视为月份列）
     detail_base_cols = {"Factory", "Order Type", "Team", "Customer", "Product Type", "Date"}
-    ttl_cols = [c for c in ["2025 Ttl", "2026 Ttl", "Ttl"] if c in factory_all_df.columns]
+    
+    # Dynamically detect year total columns (e.g., "2024 Ttl", "2025 Ttl", "2026 Ttl", "2027 Ttl")
+    year_ttl_cols = [c for c in factory_all_df.columns if c.endswith(" Ttl") and c != "Ttl"]
+    ttl_cols = year_ttl_cols + (["Ttl"] if "Ttl" in factory_all_df.columns else [])
+    
     month_cols = [
         c
         for c in factory_all_df.columns
