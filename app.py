@@ -16,7 +16,13 @@ from datetime import datetime, date
 
 import streamlit as st
 
-from process import ReportError, generate_pivot_report_from_upload
+from process import (
+    ReportError,
+    generate_pivot_report_from_upload,
+    DATE_BASIS_EX_FTY,
+    DATE_BASIS_CUSTOMER,
+    DATE_BASIS_COLUMN_MAP,
+)
 
 
 def _pretty_list(items: list[str], max_items: int = 10) -> str:
@@ -59,11 +65,12 @@ def main() -> None:
     def _reset_report_date_to_today() -> None:
         _set_report_date(datetime.now().date())
 
-    # 新文件：清理缓存，并把“报表日期”重置为今天（允许用户再自定义）
+    # 新文件：清理缓存，并把"报表日期"重置为今天，"日期基准"重置为默认值
     if st.session_state.get("uploaded_name") != uploaded.name:
         st.session_state.pop("pivot_bytes", None)
         st.session_state.pop("stats", None)
         st.session_state["uploaded_name"] = uploaded.name
+        st.session_state["date_basis"] = DATE_BASIS_EX_FTY
         _reset_report_date_to_today()
 
     base_name = os.path.splitext(uploaded.name)[0]
@@ -81,7 +88,33 @@ def main() -> None:
             st.session_state.pop("generated_report_date", None)
             st.info("你已更改报表日期，请重新点击“生成报表”以应用新日期。")
 
-    c1, c2, c3 = st.columns([1, 1, 0.7])
+    # Date basis selector - controls which date column is used for month/year grouping
+    DATE_BASIS_OPTIONS = {
+        DATE_BASIS_EX_FTY: "Ex-Fty (Request Garment Delivery)",
+        DATE_BASIS_CUSTOMER: "Customer Delivery Date",
+    }
+    current_date_basis = st.session_state.get("date_basis", DATE_BASIS_EX_FTY)
+    
+    # If date_basis changed, invalidate cached report
+    if "pivot_bytes" in st.session_state:
+        last_basis = st.session_state.get("generated_date_basis")
+        if last_basis and last_basis != current_date_basis:
+            st.session_state.pop("pivot_bytes", None)
+            st.session_state.pop("stats", None)
+            st.session_state.pop("generated_date_basis", None)
+            st.info("你已更改日期基准，请重新点击「生成报表」以应用新设置。")
+    
+    c0, c1, c2, c3 = st.columns([1.2, 1, 1, 0.7])
+    with c0:
+        selected_basis = st.selectbox(
+            "日期基准",
+            options=list(DATE_BASIS_OPTIONS.keys()),
+            format_func=lambda x: DATE_BASIS_OPTIONS[x],
+            index=list(DATE_BASIS_OPTIONS.keys()).index(current_date_basis),
+            key="date_basis_selector",
+            help="选择用于生成月份/年份列的日期列",
+        )
+        st.session_state["date_basis"] = selected_basis
     with c1:
         run_btn = st.button("生成报表", type="primary", use_container_width=True)
     with c2:
@@ -120,6 +153,7 @@ def main() -> None:
 
     if run_btn:
         excel_bytes = uploaded.getvalue()
+        date_basis = st.session_state.get("date_basis", DATE_BASIS_EX_FTY)
 
         with st.status("正在处理……", expanded=True) as status:
             try:
@@ -128,6 +162,7 @@ def main() -> None:
                     excel_bytes=excel_bytes,
                     filename=uploaded.name,
                     report_date=report_date,
+                    date_basis=date_basis,
                 )
 
                 st.write("2）生成 Excel 报表完成。")
@@ -135,6 +170,7 @@ def main() -> None:
                 st.session_state["pivot_bytes"] = pivot_bytes
                 st.session_state["stats"] = stats
                 st.session_state["generated_report_date"] = report_date
+                st.session_state["generated_date_basis"] = date_basis
 
                 status.update(label="处理完成", state="complete")
 
@@ -163,6 +199,7 @@ def main() -> None:
 
         with st.expander("更多信息", expanded=False):
             st.write(f"报表日期：{stats.get('report_date', '')}")
+            st.write(f"日期基准：{stats.get('date_column', '')}")
             st.write(f"工厂：{_pretty_list(stats.get('factories', []), max_items=20)}")
             st.write(f"产品类型：{_pretty_list(stats.get('product_types', []), max_items=20)}")
 

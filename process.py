@@ -39,10 +39,27 @@ from openpyxl.worksheet.filters import AutoFilter, FilterColumn
 
 
 # ======================
+# 用于 UI 友好提示的异常
+# ======================
+class ReportError(RuntimeError):
+    """用于 UI 友好提示的异常。"""
+
+
+# ======================
 # 自动默认值（不暴露任何 UI 选项）
 # ======================
 SCAN_ROWS_DEFAULT = 50
 CUSTOMER_LABEL_DEFAULT = "ALL"  # Pivot 报表中 Customer 字段固定写入
+
+# Date basis options for pivot month/year grouping
+DATE_BASIS_EX_FTY = "ex_fty"  # "Request Garment Delivery (DeadLine ex-fty)"
+DATE_BASIS_CUSTOMER = "customer_delivery"  # "Customer Delivery Date"
+DATE_BASIS_DEFAULT = DATE_BASIS_EX_FTY
+
+DATE_BASIS_COLUMN_MAP = {
+    DATE_BASIS_EX_FTY: "Request Garment Delivery (DeadLine ex-fty)",
+    DATE_BASIS_CUSTOMER: "Customer Delivery Date",
+}
 
 
 # ======================
@@ -572,6 +589,7 @@ def generate_pivot_tables(
     value_col: str = "Order Qty",
     report_date: str,
     customer: str,
+    date_basis: str = DATE_BASIS_DEFAULT,
 ) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     if len(df) == 0:
         return {}, []
@@ -582,9 +600,18 @@ def generate_pivot_tables(
 
     df[value_col] = _coerce_numeric_series(df[value_col]).fillna(0)
     
-    # Use "Request Garment Delivery (DeadLine ex-fty)" for month grouping
-    date_col = "Request Garment Delivery (DeadLine ex-fty)"
+    # Determine date column based on date_basis parameter
+    date_col = DATE_BASIS_COLUMN_MAP.get(date_basis, DATE_BASIS_COLUMN_MAP[DATE_BASIS_DEFAULT])
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    
+    # Validate: ensure the chosen date column has valid dates
+    valid_dates = df[date_col].dropna()
+    if len(valid_dates) == 0:
+        raise ReportError(
+            f"所选日期列「{date_col}」没有有效日期数据。"
+            f"请检查源数据或选择另一个日期基准。"
+        )
+    
     df["MonthLabel"] = df[date_col].dt.strftime("%b-%y")
 
     df["Order Type"] = df["Order Type"].replace({"FR": "Forecast-FR"})
@@ -592,7 +619,11 @@ def generate_pivot_tables(
     min_date = df[date_col].min()
     max_date = df[date_col].max()
     if pd.notna(min_date) and pd.notna(max_date):
-        all_months = pd.date_range(min_date, max_date, freq="MS").strftime("%b-%y").tolist()
+        # Fix: Ensure month range ALWAYS includes the month containing min_date
+        # e.g., if min_date is 2025-08-11, include Aug-25
+        start = min_date.to_period("M").to_timestamp()  # month start
+        end = max_date.to_period("M").to_timestamp()    # month start
+        all_months = pd.date_range(start, end, freq="MS").strftime("%b-%y").tolist()
     else:
         all_months = []
 
@@ -1216,10 +1247,6 @@ def pivot_report_multi_to_xlsx_bytes_no_table(
 # ======================
 # 高层封装：从上传文件 bytes 生成报表
 # ======================
-class ReportError(RuntimeError):
-    """用于 UI 友好提示的异常。"""
-
-
 def generate_pivot_report_from_upload(
     excel_bytes: bytes,
     *,
@@ -1227,8 +1254,17 @@ def generate_pivot_report_from_upload(
     scan_rows: int = SCAN_ROWS_DEFAULT,
     customer_label: str = CUSTOMER_LABEL_DEFAULT,
     report_date: Optional[str] = None,
+    date_basis: str = DATE_BASIS_DEFAULT,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """从上传的 Excel bytes 生成 pivot 报表。
+
+    Args:
+        excel_bytes: Excel 文件内容
+        filename: 文件名
+        scan_rows: 扫描行数
+        customer_label: Customer 字段值
+        report_date: 报表日期
+        date_basis: 日期基准 ("ex_fty" 或 "customer_delivery")
 
     Returns:
         (pivot_xlsx_bytes, stats)
@@ -1239,6 +1275,7 @@ def generate_pivot_report_from_upload(
         product_types: List[str]
         months: Dict[str, List[str]]  # metric -> months
         report_date: str
+        date_basis: str
     """
     if report_date is None:
         report_date = datetime.now().strftime("%b-%d")
@@ -1302,6 +1339,7 @@ def generate_pivot_report_from_upload(
             value_col=metric_col,
             report_date=report_date,
             customer=customer_label,
+            date_basis=date_basis,
         )
         if not pivot_tables:
             raise ReportError(f"未能生成透视表（{metric_label}），请检查该列是否存在有效值。")
@@ -1310,6 +1348,9 @@ def generate_pivot_report_from_upload(
 
     pivot_bytes = pivot_report_multi_to_xlsx_bytes_no_table(pivot_tables_by_metric, report_date)
 
+    # Get the actual date column name used
+    date_col_used = DATE_BASIS_COLUMN_MAP.get(date_basis, DATE_BASIS_COLUMN_MAP[DATE_BASIS_DEFAULT])
+    
     stats = {
         "report_date": report_date,
         "warnings": warnings_text,
@@ -1317,6 +1358,8 @@ def generate_pivot_report_from_upload(
         "factories": sorted(combined_df["Factory"].dropna().astype(str).unique().tolist()),
         "product_types": sorted(combined_df["Product Type"].dropna().astype(str).unique().tolist()),
         "months": month_cols_by_metric,
+        "date_basis": date_basis,
+        "date_column": date_col_used,
     }
 
     return pivot_bytes, stats
