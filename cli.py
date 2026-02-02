@@ -14,7 +14,12 @@ import argparse
 import os
 from datetime import datetime
 
-from process import ReportError, generate_pivot_report_from_upload
+from process import (
+    ReportError,
+    generate_pivot_report_from_upload,
+    DATE_BASIS_EX_FTY,
+    DATE_BASIS_CUSTOMER,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,6 +27,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-i", "--input", required=True, help="输入 Excel 文件路径 (.xlsx/.xls)")
     p.add_argument("-o", "--output", default=None, help="输出 Excel 文件路径 (.xlsx)")
     p.add_argument("--report-date", default=None, help="报表日期（默认：今天，如 Jan-18）")
+    p.add_argument(
+        "--date-basis",
+        choices=[DATE_BASIS_EX_FTY, DATE_BASIS_CUSTOMER],
+        default=DATE_BASIS_EX_FTY,
+        help=(
+            f"日期基准列（默认：{DATE_BASIS_EX_FTY}）。"
+            f"选项：{DATE_BASIS_EX_FTY}=Ex-Fty日期, {DATE_BASIS_CUSTOMER}=客户交期"
+        ),
+    )
     return p.parse_args()
 
 
@@ -37,18 +51,22 @@ def main() -> None:
 
     report_date = args.report_date or datetime.now().strftime("%b-%d")
 
+    date_basis = args.date_basis
+
     try:
         excel_bytes = open(in_path, "rb").read()
         pivot_bytes, stats = generate_pivot_report_from_upload(
             excel_bytes,
             filename=os.path.basename(in_path),
             report_date=report_date,
+            date_basis=date_basis,
         )
         with open(out_path, "wb") as f:
             f.write(pivot_bytes)
 
         print("[OK] 报表已生成：", out_path)
         print("     报表日期：", stats.get("report_date"))
+        print("     日期基准：", stats.get("date_column"))
         print("     行数：", stats.get("rows_used"))
         print("     工厂：", ", ".join(stats.get("factories", [])))
 
