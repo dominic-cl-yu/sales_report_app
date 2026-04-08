@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Build trigger: 2026-02-02 11:30
+# Build trigger: 2026-04-08 (fixed format-variation bugs)
 """销售透视报表处理核心（无 UI）
 
 目标（按你的最新要求）：
@@ -79,7 +79,19 @@ TARGET_COLS = [
     "Customer Delivery Date",
 ]
 
-ORDER_TYPE_ALLOWED = {"AO", "FR"}
+ORDER_TYPE_ALLOWED = {"AO", "FR"}  # Exact matches; prefix matching handled in _is_allowed_order_type()
+
+
+def _is_allowed_order_type(val: str) -> bool:
+    """Return True if the order-type value should be kept from AOFR sheets.
+
+    Rules:
+    - Exact match: 'AO' or 'FR'
+    - Prefix match: starts with 'AO' (e.g. 'AO-Close' → excluded; but bare 'AO' → kept)
+    - Prefix match: starts with 'FR' (e.g. 'FR-low priority' → kept as Forecast-FR)
+    """
+    v = str(val).strip().upper()
+    return v == "AO" or v.startswith("FR")
 
 ORDER_TYPE_SORT_ORDER = {
     "SO": 0,
@@ -112,6 +124,15 @@ def apply_known_mapping(team: str) -> Tuple[str, bool]:
     """将 team 依据已知规则映射到标准 Team。
 
     返回： (映射后的 team, 是否命中规则)
+
+    规则（按优先级）：
+    1. Legging / legging Reservation  → "legging Reservation" (canonical lowercase-l form)
+    2. Cotton Panty (± Reservation)   → "Cotton Panty"
+    3. SW (± variants like SW-Kids)   → "SW"
+    4. Sports (± variants like Sports-Legging, Sports Reservation) → "Sports"
+    5. Fancy (± Reservation)          → "Fancy"
+    6. Brands-COS / Brands-Stories    → pass-through unchanged
+    7. Generic "X Reservation" strip  → strip " Reservation" suffix and re-check VALID_TEAMS
     """
     if pd.isna(team) or not str(team).strip():
         return team, False
@@ -119,15 +140,34 @@ def apply_known_mapping(team: str) -> Tuple[str, bool]:
     team_str = str(team).strip()
     lower = team_str.lower()
 
-    if "sw" in lower:
-        return "SW", True
-    if "sports" in lower:
+    # Legging Reservation (any casing) → canonical "legging Reservation"
+    if "legging" in lower and "reservation" in lower:
+        return "legging Reservation", True
+    # Bare 'Sports-Legging' (SO rows) → Sports
+    if lower == "sports-legging":
         return "Sports", True
-    if "fancy" in lower:
-        return "Fancy", True
-    if "cotton panty reservation" in lower:
+
+    # Cotton Panty (with or without Reservation)
+    if "cotton panty" in lower:
         return "Cotton Panty", True
 
+    # SW (includes SW-Kids, SW Reservation, etc.) — check before 'sports'
+    if re.match(r"sw(\b|[-])", lower):
+        return "SW", True
+
+    # Sports (includes Sports Reservation, Sports-Legging already handled above)
+    if "sports" in lower:
+        return "Sports", True
+
+    # Fancy (includes Fancy Reservation)
+    if "fancy" in lower:
+        return "Fancy", True
+
+    # Brands-COS / Brands-Stories — recognised pass-through
+    if lower.startswith("brands-"):
+        return team_str, True
+
+    # Generic strip of " Reservation" / " reservation" suffix
     cleaned = re.sub(r"\s*[Rr]eservation.*$", "", team_str).strip()
     if cleaned != team_str and cleaned in VALID_TEAMS:
         return cleaned, True
@@ -155,7 +195,8 @@ def _norm(s: Any) -> str:
     if s is None:
         return ""
     s = str(s).strip()
-    s = re.sub(r"\s+", " ", s)
+    # Collapse all whitespace including embedded newlines/tabs into single space
+    s = re.sub(r"[\s\n\r\t]+", " ", s)
     s = s.replace("\u00A0", " ")
     s = s.lower()
     s = s.replace("（", "(").replace("）", ")")
@@ -175,21 +216,50 @@ def _norm_key(s: Any) -> str:
 # ======================
 def _build_header_aliases() -> Dict[str, List[str]]:
     return {
-        "Factory": ["factory"],
-        "Team": ["team"],
+        "Factory": [
+            "factory",
+            "factory code",
+            "factory name",
+            "fty",
+            "plant",
+            "site",
+        ],
+        "Team": ["team", "team name", "department", "dept"],
         "Order Type": ["order type", "order_type", "ordertype"],
-        "Order Qty": ["order qty", "order quantity", "qty"],
-        "SAH": ["sah"],
-        "Sales (USD)": ["sales (usd)", "sales usd", "sales"],
-        "GP (USD)": ["gp (usd)", "gp usd", "gp"],
-        "Product Type": ["product type"],
+        "Order Qty": [
+            "order qty",
+            "order quantity",
+            "qty",
+            "quantity",
+            "pcs",
+            "pieces",
+            "so qty",
+            "ao qty",
+        ],
+        "SAH": ["sah", "standard allowed hours", "std hours"],
+        "Sales (USD)": ["sales (usd)", "sales usd", "sales", "revenue (usd)", "revenue"],
+        "GP (USD)": ["gp (usd)", "gp usd", "gp", "gross profit (usd)", "gross profit"],
+        "Product Type": ["product type", "product category", "category", "garment type"],
         "Request Garment Delivery (DeadLine ex-fty)": [
             "request garment delivery (deadline ex-fty)",
+            "requested garment delivery (deadline ex-fty)",
             "requested garment delivery",
+            "request garment delivery",
             "deadline ex-fty",
             "ex-fty",
+            "ex fty date",
+            "ex fty",
+            "ex factory date",
+            "ex factory",
+            "garment delivery deadline",
         ],
-        "Customer Delivery Date": ["customer delivery date", "delivery date"],
+        "Customer Delivery Date": [
+            "customer delivery date",
+            "delivery date",
+            "customer del date",
+            "cust delivery",
+            "customer del",
+        ],
     }
 
 
@@ -261,7 +331,9 @@ def _pick_order_type_column(df: pd.DataFrame) -> Optional[str]:
     def score(col: str) -> Tuple[int, int]:
         s = df[col].dropna().astype(str).str.strip().str.upper()
         s = s[s != ""]
-        return (s.isin(ORDER_TYPE_ALLOWED)).sum(), len(s)
+        # Use prefix-aware check consistent with _is_allowed_order_type
+        hits = s.apply(lambda v: v == "AO" or v.startswith("FR")).sum()
+        return hits, len(s)
 
     ranked = [(c, *score(c)) for c in candidates]
     ranked.sort(key=lambda x: (x[1], x[2]), reverse=True)
@@ -465,6 +537,7 @@ def process_excel(
     """
     team_cache: Dict[str, str] = {}
     all_dfs: List[pd.DataFrame] = []
+    skipped_order_types: Dict[str, int] = {}  # tracks unrecognised Order Type values dropped
 
     for sheet in xls.sheet_names:
         header_row, score, _matched = detect_header_row(xls, sheet, scan_rows)
@@ -482,16 +555,48 @@ def process_excel(
         else:
             df = _drop_footer_note_rows(df)
 
-        sheet_upper = str(sheet).upper()
-        if sheet_upper == "SO":
+        sheet_upper = str(sheet).upper().strip()
+        # Detect SO sheets: exact 'SO', or common long-form names
+        _SO_SHEET_NAMES = {"SO", "SALES ORDER", "SALES ORDERS", "S.O.", "SO REPORT"}
+        _is_so_sheet = sheet_upper in _SO_SHEET_NAMES
+        # Detect AOFR sheets: contains 'AO' or 'FR' but is NOT a SO sheet
+        _is_aofr_sheet = not _is_so_sheet and ("AO" in sheet_upper or "FR" in sheet_upper)
+
+        if _is_so_sheet:
+            # Drop any column that aliases to "Order Type" BEFORE rename so it
+            # cannot overwrite the hardcoded "SO" label we assign below.
+            # The new Apr file has an "Order\nType" col (with embedded newline)
+            # containing SO-level values like 'Normal order', 'Speed order', etc.
+            # Without this drop, _rename_and_select maps it to "Order Type" and
+            # overwrites the "SO" we set, causing wrong pivots.
+            ot_aliases_norm = {_norm_key(a) for a in ALIASES.get("Order Type", [])}
+            cols_to_drop = [
+                c for c in df.columns
+                if _norm_key(c) in ot_aliases_norm
+            ]
+            if cols_to_drop:
+                df = df.drop(columns=cols_to_drop)
             df["Order Type"] = "SO"
-        elif "AO" in sheet_upper or "FR" in sheet_upper:
+        elif _is_aofr_sheet:
             picked = _pick_order_type_column(df)
             if picked:
                 df["Order Type"] = df[picked].astype(str).str.strip().str.upper()
             else:
                 df["Order Type"] = "AO" if "AO" in sheet_upper else "FR"
-            df = df[df["Order Type"].isin(ORDER_TYPE_ALLOWED)]
+            # Track unrecognised order types before filtering (for user warnings)
+            all_ot_vals = df["Order Type"].dropna().unique()
+            for ot in all_ot_vals:
+                if not _is_allowed_order_type(str(ot)):
+                    count = int((df["Order Type"] == ot).sum())
+                    if count > 0:
+                        skipped_order_types[str(ot)] = skipped_order_types.get(str(ot), 0) + count
+            # Use prefix-aware filter: bare 'AO' only; anything starting with 'FR'
+            df = df[df["Order Type"].apply(_is_allowed_order_type)]
+            # Normalise 'FR-low priority' etc. → plain 'FR' so downstream
+            # replace({"FR": "Forecast-FR"}) works correctly
+            df["Order Type"] = df["Order Type"].apply(
+                lambda v: "FR" if str(v).strip().upper().startswith("FR") else v
+            )
 
         cleaned = _rename_and_select(df)
 
@@ -520,10 +625,11 @@ def process_excel(
         if len(cleaned) > 0 and not cleaned.isna().all().all():
             all_dfs.append(cleaned)
 
-    if all_dfs:
-        return pd.concat(all_dfs, ignore_index=True)
+    combined = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame(columns=["_Sheet"] + TARGET_COLS)
 
-    return pd.DataFrame(columns=["_Sheet"] + TARGET_COLS)
+    # Attach skipped order type info as a DataFrame attribute for caller to inspect
+    combined.attrs["skipped_order_types"] = skipped_order_types
+    return combined
 
 
 # ======================
@@ -576,8 +682,20 @@ def _coerce_numeric_series(s: pd.Series) -> pd.Series:
     mask_str = ser.map(lambda x: isinstance(x, str))
     if mask_str.any():
         cleaned = ser.loc[mask_str].astype(str).str.strip()
+        # Accounting-style negatives: (500) → -500
         cleaned = cleaned.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
-        cleaned = cleaned.str.replace(",", "", regex=False)
+        # Remove thousand separators (commas and spaces between digits)
+        cleaned = cleaned.str.replace(r",", "", regex=False)
+        # K / M / B suffixes typed by factory workers: '1.5K' → 1500
+        def _expand_suffix(v: str) -> str:
+            m = re.match(r"^([\-+]?[0-9]*\.?[0-9]+)\s*([KkMmBb])$", v.strip())
+            if m:
+                num, suffix = float(m.group(1)), m.group(2).upper()
+                multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix]
+                return str(int(num * multiplier))
+            return v
+        cleaned = cleaned.map(_expand_suffix)
+        # Strip anything that isn't numeric after above conversions
         cleaned = cleaned.str.replace(r"[^0-9eE\.\+\-]", "", regex=True)
         ser.loc[mask_str] = cleaned
 
@@ -617,13 +735,36 @@ def generate_pivot_tables(
 
     df["Order Type"] = df["Order Type"].replace({"FR": "Forecast-FR"})
 
-    min_date = df[date_col].min()
-    max_date = df[date_col].max()
+    # Clamp the date range used for month-column generation to a reasonable window.
+    # A single corrupt cell (e.g. Excel serial mis-read as year 2173) would otherwise
+    # generate thousands of columns, causing a memory spike or crash.
+    # Rows with out-of-range dates still appear in the pivot (their MonthLabel is NaT
+    # and they aggregate to 0 for every month column, which is correct).
+    _today = pd.Timestamp.now()
+    _clamp_min = pd.Timestamp(_today.year - 3, 1, 1)   # 3 years back
+    _clamp_max = pd.Timestamp(_today.year + 6, 12, 31)  # 6 years forward
+
+    valid_dates = df[date_col].dropna()
+    valid_dates_clamped = valid_dates[(valid_dates >= _clamp_min) & (valid_dates <= _clamp_max)]
+
+    if len(valid_dates_clamped) == 0:
+        # All dates are out of range - fall back to unclamped (handles far-future reports)
+        valid_dates_clamped = valid_dates
+
+    clamped_out = len(valid_dates) - len(valid_dates_clamped)
+    if clamped_out > 0:
+        import warnings
+        warnings.warn(
+            f"{clamped_out} date values in '{date_col}' are outside the expected range "
+            f"({_clamp_min.year}-{_clamp_max.year}) and will not generate month columns. "
+            f"These rows are still included in totals where their month falls within the range."
+        )
+
+    min_date = valid_dates_clamped.min()
+    max_date = valid_dates_clamped.max()
     if pd.notna(min_date) and pd.notna(max_date):
-        # Fix: Ensure month range ALWAYS includes the month containing min_date
-        # e.g., if min_date is 2025-08-11, include Aug-25
-        start = min_date.to_period("M").to_timestamp()  # month start
-        end = max_date.to_period("M").to_timestamp()    # month start
+        start = min_date.to_period("M").to_timestamp()
+        end = max_date.to_period("M").to_timestamp()
         all_months = pd.date_range(start, end, freq="MS").strftime("%b-%y").tolist()
     else:
         all_months = []
@@ -1351,10 +1492,22 @@ def generate_pivot_report_from_upload(
 
     # Get the actual date column name used
     date_col_used = DATE_BASIS_COLUMN_MAP.get(date_basis, DATE_BASIS_COLUMN_MAP[DATE_BASIS_DEFAULT])
-    
+
+    # Build human-readable warning for skipped order types
+    skipped = combined_df.attrs.get("skipped_order_types", {})
+    skipped_warning = ""
+    if skipped:
+        lines = ", ".join(f"\"{k}\" ({v} rows)" for k, v in sorted(skipped.items()))
+        skipped_warning = (
+            f"⚠️ The following Order Type values in AOFR/FR sheets were not recognised "
+            f"and were excluded from the pivot: {lines}.\n"
+            f"Only 'AO' and 'FR' (plus FR-prefixed variants) are included."
+        )
+    combined_warnings = "\n".join(filter(None, [warnings_text, skipped_warning]))
+
     stats = {
         "report_date": report_date,
-        "warnings": warnings_text,
+        "warnings": combined_warnings,
         "rows_used": int(len(combined_df)),
         "factories": sorted(combined_df["Factory"].dropna().astype(str).unique().tolist()),
         "product_types": sorted(combined_df["Product Type"].dropna().astype(str).unique().tolist()),
