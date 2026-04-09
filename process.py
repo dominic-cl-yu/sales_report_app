@@ -1,1519 +1,535 @@
-# -*- coding: utf-8 -*-
-# Build trigger: 2026-04-08 (fixed format-variation bugs)
-"""销售透视报表处理核心（无 UI）
-
-目标（按你的最新要求）：
-- 保留当前报表的版式/标题/列顺序等“NEW 的改动”
-- 恢复 Total 行为 Excel 公式：=SUBTOTAL(109,...)（可随筛选动态变化）
-
-功能：
-- 读取订单状态 Excel（支持多 sheet，自动识别表头）
-- 清洗/规范化列名与 Team
-- 按 Factory / Team / Order Type 生成按月透视表（Order Qty / SAH / Sales）
-- 输出为一个 Excel 文件（9 个 sheet：3 个 Factory * 3 个指标）
-
-说明：
-- 本模块不依赖 streamlit；可被 Streamlit/Tkinter/CLI 等界面调用。
-- Customer 字段固定写入 "ALL"（可在常量 CUSTOMER_LABEL_DEFAULT 修改）。
-
-作者：基于用户提供的逻辑重构
-"""
 
 from __future__ import annotations
 
-import io
-import os
 import re
-import tempfile
-import time as time_mod
-from datetime import datetime, date, time
-from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
+from io import BytesIO
+from typing import BinaryIO, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
-
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.datetime import to_excel
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.worksheet.filters import AutoFilter, FilterColumn
 
+DATE_BASIS_EX_FTY = "ex_fty"
+DATE_BASIS_CUSTOMER = "customer"
 
-# ======================
-# 用于 UI 友好提示的异常
-# ======================
-class ReportError(RuntimeError):
-    """用于 UI 友好提示的异常。"""
-
-
-# ======================
-# 自动默认值（不暴露任何 UI 选项）
-# ======================
-SCAN_ROWS_DEFAULT = 50
-CUSTOMER_LABEL_DEFAULT = "ALL"  # Pivot 报表中 Customer 字段固定写入
-
-# Date basis options for pivot month/year grouping
-DATE_BASIS_EX_FTY = "ex_fty"  # "Request Garment Delivery (DeadLine ex-fty)"
-DATE_BASIS_CUSTOMER = "customer_delivery"  # "Customer Delivery Date"
-DATE_BASIS_DEFAULT = DATE_BASIS_EX_FTY
-
-DATE_BASIS_COLUMN_MAP = {
-    DATE_BASIS_EX_FTY: "Request Garment Delivery (DeadLine ex-fty)",
+DATE_BASIS_COLUMN_MAP: Mapping[str, str] = {
+    DATE_BASIS_EX_FTY: "Ex-Fty (Request Garment Delivery)",
     DATE_BASIS_CUSTOMER: "Customer Delivery Date",
 }
 
-
-# ======================
-# 配置
-# ======================
-TARGET_COLS = [
-    "Factory",
-    "Team",
-    "Order Type",
-    "Order Qty",
-    "SAH",
-    "Sales (USD)",
-    "GP (USD)",
-    "Product Type",
-    "Request Garment Delivery (DeadLine ex-fty)",
-    "Customer Delivery Date",
-]
-
-ORDER_TYPE_ALLOWED = {"AO", "FR"}  # Exact matches; prefix matching handled in _is_allowed_order_type()
+SUMMARY_ORDER_TYPES: List[str] = ["SO", "AO", "Forecast-FR"]
+METRICS: List[str] = ["Order Qty", "SAH", "Sales (USD)"]
+FACTORY_ORDER: List[str] = ["CMBD", "CMSL", "CMVN"]
 
 
-def _is_allowed_order_type(val: str) -> bool:
-    """Return True if the order-type value should be kept from AOFR sheets.
-
-    Rules:
-    - Exact match: 'AO' or 'FR'
-    - Prefix match: starts with 'AO' (e.g. 'AO-Close' → excluded; but bare 'AO' → kept)
-    - Prefix match: starts with 'FR' (e.g. 'FR-low priority' → kept as Forecast-FR)
-    """
-    v = str(val).strip().upper()
-    return v == "AO" or v.startswith("FR")
-
-ORDER_TYPE_SORT_ORDER = {
-    "SO": 0,
-    "AO": 1,
-    "Forecast-FR": 2,
-    "Total": 999,
-}
-
-VALID_TEAMS = {
-    "Sports",
-    "Fancy",
-    "SW",
-    "Cotton Panty",
-    "Brands-COS",
-    "Brands-Stories",
-}
-
-# 指标配置：每个 Factory 输出 3 张表（Order Qty / SAH / Sales (USD)）
-METRIC_SPECS: List[Tuple[str, str]] = [
-    ("Order Qty", "Order Qty"),
-    ("SAH", "SAH"),
-    ("Sales (USD)", "Sales (USD)"),
-]
+class ReportError(Exception):
+    """User-facing processing error."""
 
 
-# ======================
-# Team 映射（规则）
-# ======================
-def apply_known_mapping(team: str) -> Tuple[str, bool]:
-    """将 team 依据已知规则映射到标准 Team。
-
-    返回： (映射后的 team, 是否命中规则)
-
-    规则（按优先级）：
-    1. Legging / legging Reservation  → "legging Reservation" (canonical lowercase-l form)
-    2. Cotton Panty (± Reservation)   → "Cotton Panty"
-    3. SW (± variants like SW-Kids)   → "SW"
-    4. Sports (± variants like Sports-Legging, Sports Reservation) → "Sports"
-    5. Fancy (± Reservation)          → "Fancy"
-    6. Brands-COS / Brands-Stories    → pass-through unchanged
-    7. Generic "X Reservation" strip  → strip " Reservation" suffix and re-check VALID_TEAMS
-    """
-    if pd.isna(team) or not str(team).strip():
-        return team, False
-
-    team_str = str(team).strip()
-    lower = team_str.lower()
-
-    # Legging Reservation (any casing) → canonical "legging Reservation"
-    if "legging" in lower and "reservation" in lower:
-        return "legging Reservation", True
-    # Bare 'Sports-Legging' (SO rows) → Sports
-    if lower == "sports-legging":
-        return "Sports", True
-
-    # Cotton Panty (with or without Reservation)
-    if "cotton panty" in lower:
-        return "Cotton Panty", True
-
-    # SW (includes SW-Kids, SW Reservation, etc.) — check before 'sports'
-    if re.match(r"sw(\b|[-])", lower):
-        return "SW", True
-
-    # Sports (includes Sports Reservation, Sports-Legging already handled above)
-    if "sports" in lower:
-        return "Sports", True
-
-    # Fancy (includes Fancy Reservation)
-    if "fancy" in lower:
-        return "Fancy", True
-
-    # Brands-COS / Brands-Stories — recognised pass-through
-    if lower.startswith("brands-"):
-        return team_str, True
-
-    # Generic strip of " Reservation" / " reservation" suffix
-    cleaned = re.sub(r"\s*[Rr]eservation.*$", "", team_str).strip()
-    if cleaned != team_str and cleaned in VALID_TEAMS:
-        return cleaned, True
-
-    return team_str, False
+@dataclass(frozen=True)
+class ReportConfig:
+    report_date: Optional[str] = None
+    date_basis: str = DATE_BASIS_EX_FTY
 
 
-def categorize_team(team: str, cache: Dict[str, str]) -> str:
-    """带缓存的 Team 规范化。"""
-    team_str = str(team).strip() if team else ""
-    if team_str in cache:
-        return cache[team_str]
-
-    mapped, was_rule_mapped = apply_known_mapping(team_str)
-    result = mapped if was_rule_mapped else team_str
-
-    cache[team_str] = result
-    return result
-
-
-# ======================
-# 规范化工具
-# ======================
-def _norm(s: Any) -> str:
-    if s is None:
+def _normalize_text(value: object) -> str:
+    if pd.isna(value):
         return ""
-    s = str(s).strip()
-    # Collapse all whitespace including embedded newlines/tabs into single space
-    s = re.sub(r"[\s\n\r\t]+", " ", s)
-    s = s.replace("\u00A0", " ")
-    s = s.lower()
-    s = s.replace("（", "(").replace("）", ")")
-    s = s.replace("–", "-").replace("—", "-")
-    return s
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def _norm_key(s: Any) -> str:
-    s = _norm(s)
-    s = re.sub(r"[^a-z0-9()%-]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def _normalize_key(value: object) -> str:
+    text = _normalize_text(value).lower()
+    text = re.sub(r"[^a-z0-9]+", "", text)
+    return text
 
 
-# ======================
-# 列别名
-# ======================
-def _build_header_aliases() -> Dict[str, List[str]]:
-    return {
-        "Factory": [
-            "factory",
-            "factory code",
-            "factory name",
-            "fty",
-            "plant",
-            "site",
-        ],
-        "Team": ["team", "team name", "department", "dept"],
-        "Order Type": ["order type", "order_type", "ordertype"],
-        "Order Qty": [
-            "order qty",
-            "order quantity",
-            "qty",
-            "quantity",
-            "pcs",
-            "pieces",
-            "so qty",
-            "ao qty",
-        ],
-        "SAH": ["sah", "standard allowed hours", "std hours"],
-        "Sales (USD)": ["sales (usd)", "sales usd", "sales", "revenue (usd)", "revenue"],
-        "GP (USD)": ["gp (usd)", "gp usd", "gp", "gross profit (usd)", "gross profit"],
-        "Product Type": ["product type", "product category", "category", "garment type"],
-        "Request Garment Delivery (DeadLine ex-fty)": [
-            "request garment delivery (deadline ex-fty)",
-            "requested garment delivery (deadline ex-fty)",
-            "requested garment delivery",
-            "request garment delivery",
-            "deadline ex-fty",
-            "ex-fty",
-            "ex fty date",
-            "ex fty",
-            "ex factory date",
-            "ex factory",
-            "garment delivery deadline",
-        ],
-        "Customer Delivery Date": [
-            "customer delivery date",
-            "delivery date",
-            "customer del date",
-            "cust delivery",
-            "customer del",
-        ],
-    }
-
-
-ALIASES = _build_header_aliases()
-
-
-# ======================
-# 表头检测（pd.ExcelFile 版本）
-# ======================
-def _score_row_as_header(row_values: List[object]) -> Tuple[int, Dict[str, int]]:
-    normed = [_norm_key(v) for v in row_values]
-    matched: Dict[str, int] = {}
-
-    for target, alias_list in ALIASES.items():
-        for idx, cell in enumerate(normed):
-            if not cell:
-                continue
-            for a in alias_list:
-                a_norm = _norm_key(a)
-                if cell == a_norm or a_norm in cell or cell in a_norm:
-                    matched[target] = idx
-                    break
-            if target in matched:
-                break
-
-    return len(matched), matched
-
-
-def detect_header_row(
-    xls: pd.ExcelFile,
-    sheet_name: str,
-    scan_rows: int = SCAN_ROWS_DEFAULT,
-) -> Tuple[int, int, Dict[str, int]]:
-    """在工作表前 scan_rows 行中自动找表头所在行。"""
-    preview = pd.read_excel(
-        xls,
-        sheet_name=sheet_name,
-        header=None,
-        nrows=scan_rows,
+def _clean_numeric(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").fillna(0)
+    cleaned = (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.strip()
     )
-    best_row = 0
-    best_score = -1
-    best_matched: Dict[str, int] = {}
+    cleaned = cleaned.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaT": pd.NA})
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
-    for r in range(len(preview)):
-        score, matched = _score_row_as_header(preview.iloc[r].tolist())
+
+def _header_score(row: pd.Series) -> int:
+    keys = {_normalize_key(value) for value in row.tolist() if _normalize_text(value)}
+    expected = {
+        "factory",
+        "team",
+        "producttype",
+        "ordertype",
+        "orderqty",
+        "sah",
+        "salesusd",
+    }
+    return len(keys & expected)
+
+
+def _detect_header_row(excel_bytes: bytes, sheet_name: str, scan_rows: int = 15) -> int:
+    preview = pd.read_excel(BytesIO(excel_bytes), sheet_name=sheet_name, header=None, nrows=scan_rows)
+    scores = {idx: _header_score(preview.iloc[idx]) for idx in range(len(preview))}
+    best_idx = max(scores, key=scores.get)
+    if scores[best_idx] < 4:
+        raise ReportError(
+            f"无法识别工作表 {sheet_name!r} 的表头行。前 {scan_rows} 行最高匹配分数只有 {scores[best_idx]}。"
+        )
+    return best_idx
+
+
+def _read_sheet(excel_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    header_row = _detect_header_row(excel_bytes, sheet_name)
+    df = pd.read_excel(BytesIO(excel_bytes), sheet_name=sheet_name, header=header_row)
+    df = df.dropna(axis=1, how="all")
+    return df
+
+
+def _find_column(df: pd.DataFrame, aliases: Sequence[str], *, required: bool = True) -> Optional[str]:
+    lookup = {_normalize_key(col): col for col in df.columns}
+    for alias in aliases:
+        hit = lookup.get(_normalize_key(alias))
+        if hit is not None:
+            return hit
+    if required:
+        raise ReportError(
+            f"None of the expected columns were found: {list(aliases)}. "
+            f"Available columns: {list(df.columns)}"
+        )
+    return None
+
+
+def _pick_best_aofr_order_type_col(df: pd.DataFrame) -> str:
+    candidates = [col for col in df.columns if _normalize_key(col).startswith("ordertype")]
+    if not candidates:
+        raise ReportError("AOFR 工作表中找不到 Order Type 列。")
+    best_col = candidates[0]
+    best_score = -1
+    for col in candidates:
+        values = df[col].dropna().astype(str).head(500)
+        score = sum(
+            1
+            for value in values
+            if any(token in _normalize_text(value).lower() for token in ("ao", "fr", "forecast", "close"))
+        )
         if score > best_score:
             best_score = score
-            best_row = r
-            best_matched = matched
-
-    return best_row, best_score, best_matched
+            best_col = col
+    return best_col
 
 
-# ======================
-# Order Type 列选择
-# ======================
-def _pick_order_type_column(df: pd.DataFrame) -> Optional[str]:
-    candidates = [
-        c
-        for c in df.columns
-        if _norm_key(c) in {"order type", "ordertype", "order_type"}
-    ]
-    if not candidates:
+def _parse_month_label(value: object) -> Optional[str]:
+    if pd.isna(value):
         return None
-    if len(candidates) == 1:
-        return candidates[0]
 
-    def score(col: str) -> Tuple[int, int]:
-        s = df[col].dropna().astype(str).str.strip().str.upper()
-        s = s[s != ""]
-        # Use prefix-aware check consistent with _is_allowed_order_type
-        hits = s.apply(lambda v: v == "AO" or v.startswith("FR")).sum()
-        return hits, len(s)
-
-    ranked = [(c, *score(c)) for c in candidates]
-    ranked.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    return ranked[0][0] if ranked and ranked[0][1] > 0 else None
-
-
-# ======================
-# 列重命名/选择
-# ======================
-def _rename_and_select(df: pd.DataFrame) -> pd.DataFrame:
-    rename_map: Dict[str, str] = {}
-    used_targets = set()
-
-    for col in df.columns:
-        col_norm = _norm_key(col)
-        for target, alias_list in ALIASES.items():
-            if target in used_targets:
-                continue
-            for a in alias_list:
-                a_norm = _norm_key(a)
-                if col_norm == a_norm or a_norm in col_norm or col_norm in a_norm:
-                    rename_map[col] = target
-                    used_targets.add(target)
-                    break
-            if col in rename_map:
-                break
-
-    df = df.rename(columns=rename_map)
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    for c in TARGET_COLS:
-        if c not in df.columns:
-            df[c] = pd.NA
-
-    return df[TARGET_COLS].copy()
-
-
-# ======================
-# 底部/无效行清理
-# ======================
-def _drop_footer_note_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """去掉类似页脚的“备注行”——通常是一些编号说明文本。"""
-    key_cols = ["Order Qty", "SAH", "Sales (USD)", "GP (USD)"]
-    text_cols = ["Factory", "Team", "Product Type"]
-    date_cols = [
-        "Request Garment Delivery (DeadLine ex-fty)",
-        "Customer Delivery Date",
-    ]
-
-    existing_key = [c for c in key_cols if c in df.columns]
-    existing_text = [c for c in text_cols if c in df.columns]
-    existing_date = [c for c in date_cols if c in df.columns]
-
-    has_key_signal = pd.Series(False, index=df.index)
-    for c in existing_key:
-        numeric = pd.to_numeric(df[c], errors="coerce")
-        has_key_signal = has_key_signal | numeric.notna()
-
-    has_date_signal = pd.Series(False, index=df.index)
-    for c in existing_date:
-        dt = pd.to_datetime(df[c], errors="coerce")
-        has_date_signal = has_date_signal | dt.notna()
-
-    has_text_signal = pd.Series(False, index=df.index)
-    for c in existing_text:
-        s = df[c].astype(str).str.strip()
-        has_text_signal = has_text_signal | (s.ne("") & s.ne("nan") & s.ne("none"))
-
-    non_empty_count = df.apply(
-        lambda r: sum(
-            (str(v).strip() not in ("", "nan", "None", "none")) and (pd.notna(v))
-            for v in r.values
-        ),
-        axis=1,
-    )
-
-    note_like = pd.Series(False, index=df.index)
-    scan_cols = list(df.columns[: min(10, len(df.columns))])
-    pattern = re.compile(r"^\s*\d+(\.\d+)?\s+\S+.*$", re.IGNORECASE)
-    for c in scan_cols:
-        s = df[c].astype(str)
-        note_like = note_like | s.str.match(pattern, na=False)
-
-    keep = has_key_signal | has_date_signal | has_text_signal
-    drop = (~keep) & (non_empty_count <= 1) & note_like
-    return df.loc[~drop].copy()
-
-
-def _remove_footer_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
-    """更激进的尾部清理：去掉 Summary/Benchmark 行，及明显无效行。"""
-    if len(df) == 0:
-        return df
-
-    df_str = df.astype(str)
-
-    summary_pattern = re.compile(r"\bsummary\b", re.IGNORECASE)
-    has_summary = pd.Series(False, index=df.index)
-    for col in df_str.columns:
-        exact_match = df_str[col].str.strip().str.lower() == "summary"
-        word_match = df_str[col].str.contains(summary_pattern, na=False, regex=True)
-        has_summary = has_summary | exact_match | word_match
-
-    benchmark_pattern = re.compile(r"^\s*\d+(\.\d+)?\s+benchmark\s*$", re.IGNORECASE)
-    has_benchmark = pd.Series(False, index=df.index)
-    for col in df_str.columns:
-        has_benchmark = has_benchmark | df_str[col].str.match(benchmark_pattern, na=False)
-
-    non_empty_mask = df.astype(str).apply(
-        lambda row: row.str.strip().notna()
-        & (row.str.strip() != "")
-        & (row.str.strip().str.lower() != "nan"),
-        axis=1,
-    )
-    non_empty_count = non_empty_mask.sum(axis=1)
-
-    numeric_cols = ["Order Qty", "SAH", "Sales (USD)", "GP (USD)"]
-    has_numeric = pd.Series(False, index=df.index)
-    for col in numeric_cols:
-        if col in df.columns:
-            numeric_vals = pd.to_numeric(df[col], errors="coerce")
-            has_numeric = has_numeric | numeric_vals.notna()
-
-    date_cols = [
-        "Request Garment Delivery (DeadLine ex-fty)",
-        "Customer Delivery Date",
-    ]
-    has_date = pd.Series(False, index=df.index)
-    for col in date_cols:
-        if col in df.columns:
-            date_vals = pd.to_datetime(df[col], errors="coerce")
-            has_date = has_date | date_vals.notna()
-
-    factory_valid = pd.Series(True, index=df.index)
-    team_valid = pd.Series(True, index=df.index)
-    if "Factory" in df.columns:
-        factory_str = df["Factory"].astype(str).str.strip()
-        factory_valid = (factory_str != "") & (factory_str.str.lower() != "nan") & factory_str.notna()
-    if "Team" in df.columns:
-        team_str = df["Team"].astype(str).str.strip()
-        team_valid = (team_str != "") & (team_str.str.lower() != "nan") & team_str.notna()
-
-    is_valid = factory_valid & team_valid & (has_numeric | has_date)
-    drop_mask = has_summary | has_benchmark | ((non_empty_count < 2) & ~has_numeric & ~has_date & ~is_valid)
-
-    return df.loc[~drop_mask].copy()
-
-
-# ======================
-# 校验（ExcelFile 版本）
-# ======================
-def sanity_check(
-    xls: pd.ExcelFile,
-    *,
-    scan_rows: int = SCAN_ROWS_DEFAULT,
-    min_matched: int = 6,
-    min_rows_per_sheet: int = 1,
-) -> Tuple[bool, str]:
-    if not xls.sheet_names:
-        return False, "Excel 文件中没有任何工作表。"
-
-    issues: List[str] = []
-    valid_sheets = 0
-
-    for sheet in xls.sheet_names:
-        best_row, best_score, matched = detect_header_row(xls, sheet, scan_rows)
-        if best_score < min_matched:
-            issues.append(
-                f"工作表「{sheet}」：匹配列不足（{best_score}/{len(ALIASES)}），至少需要 {min_matched}。已匹配：{', '.join(matched.keys()) or '无'}"
-            )
-            continue
-
-        df = pd.read_excel(xls, sheet_name=sheet, header=best_row).dropna(how="all")
-        if len(df) < min_rows_per_sheet:
-            issues.append(f"工作表「{sheet}」：数据行不足（{len(df)} < {min_rows_per_sheet}）")
-            continue
-
-        valid_sheets += 1
-
-    if valid_sheets == 0:
-        return False, "文件不满足基本要求：\n" + "\n".join(issues)
-
-    expl = "" if not issues else "以下工作表已跳过/警告：\n" + "\n".join(issues) + "\n将继续处理有效工作表。"
-    return True, expl
-
-
-# ======================
-# 读取并清洗（合并为一张 DataFrame）
-# ======================
-def process_excel(
-    xls: pd.ExcelFile,
-    *,
-    scan_rows: int = SCAN_ROWS_DEFAULT,
-    min_matched: int = 6,
-    footer_scan_rows: int = 300,
-) -> pd.DataFrame:
-    """读取并清洗（合并为一张 DataFrame）。
-
-    优化点：
-    - 自动跳过 Summary/Benchmark 等非数据 sheet（依据表头匹配分数）
-    - 对于超大 sheet，只在末尾 N 行做“footer/note”清理，避免整表逐行 apply 造成耗时
-    """
-    team_cache: Dict[str, str] = {}
-    all_dfs: List[pd.DataFrame] = []
-    skipped_order_types: Dict[str, int] = {}  # tracks unrecognised Order Type values dropped
-
-    for sheet in xls.sheet_names:
-        header_row, score, _matched = detect_header_row(xls, sheet, scan_rows)
-        if score < min_matched:
-            continue
-
-        df = pd.read_excel(xls, sheet_name=sheet, header=header_row).dropna(how="all")
-
-        # footer/note 清理（仅扫末尾，提高性能）
-        if len(df) > footer_scan_rows:
-            cut = max(0, len(df) - footer_scan_rows)
-            head = df.iloc[:cut]
-            tail = _drop_footer_note_rows(df.iloc[cut:])
-            df = pd.concat([head, tail], axis=0)
-        else:
-            df = _drop_footer_note_rows(df)
-
-        sheet_upper = str(sheet).upper().strip()
-        # Detect SO sheets: exact 'SO', or common long-form names
-        _SO_SHEET_NAMES = {"SO", "SALES ORDER", "SALES ORDERS", "S.O.", "SO REPORT"}
-        _is_so_sheet = sheet_upper in _SO_SHEET_NAMES
-        # Detect AOFR sheets: contains 'AO' or 'FR' but is NOT a SO sheet
-        _is_aofr_sheet = not _is_so_sheet and ("AO" in sheet_upper or "FR" in sheet_upper)
-
-        if _is_so_sheet:
-            # Drop any column that aliases to "Order Type" BEFORE rename so it
-            # cannot overwrite the hardcoded "SO" label we assign below.
-            # The new Apr file has an "Order\nType" col (with embedded newline)
-            # containing SO-level values like 'Normal order', 'Speed order', etc.
-            # Without this drop, _rename_and_select maps it to "Order Type" and
-            # overwrites the "SO" we set, causing wrong pivots.
-            ot_aliases_norm = {_norm_key(a) for a in ALIASES.get("Order Type", [])}
-            cols_to_drop = [
-                c for c in df.columns
-                if _norm_key(c) in ot_aliases_norm
-            ]
-            if cols_to_drop:
-                df = df.drop(columns=cols_to_drop)
-            df["Order Type"] = "SO"
-        elif _is_aofr_sheet:
-            picked = _pick_order_type_column(df)
-            if picked:
-                df["Order Type"] = df[picked].astype(str).str.strip().str.upper()
-            else:
-                df["Order Type"] = "AO" if "AO" in sheet_upper else "FR"
-            # Track unrecognised order types before filtering (for user warnings)
-            all_ot_vals = df["Order Type"].dropna().unique()
-            for ot in all_ot_vals:
-                if not _is_allowed_order_type(str(ot)):
-                    count = int((df["Order Type"] == ot).sum())
-                    if count > 0:
-                        skipped_order_types[str(ot)] = skipped_order_types.get(str(ot), 0) + count
-            # Use prefix-aware filter: bare 'AO' only; anything starting with 'FR'
-            df = df[df["Order Type"].apply(_is_allowed_order_type)]
-            # Normalise 'FR-low priority' etc. → plain 'FR' so downstream
-            # replace({"FR": "Forecast-FR"}) works correctly
-            df["Order Type"] = df["Order Type"].apply(
-                lambda v: "FR" if str(v).strip().upper().startswith("FR") else v
-            )
-
-        cleaned = _rename_and_select(df)
-
-        if "Product Type" in cleaned.columns:
-            cleaned["Product Type"] = cleaned["Product Type"].apply(
-                lambda x: str(x).strip().upper() if pd.notna(x) else x
-            )
-
-        if "Team" in cleaned.columns:
-            unique_teams = cleaned["Team"].dropna().unique()
-            team_mapping = {t: categorize_team(t, cache=team_cache) for t in unique_teams}
-            cleaned["Team"] = cleaned["Team"].map(team_mapping)
-
-        cleaned.insert(0, "_Sheet", sheet)
-        cleaned = cleaned.loc[:, ~cleaned.columns.duplicated()]
-
-        # footer 清理（仅扫末尾，提高性能）
-        if len(cleaned) > footer_scan_rows:
-            cut = max(0, len(cleaned) - footer_scan_rows)
-            head = cleaned.iloc[:cut]
-            tail = _remove_footer_rows(cleaned.iloc[cut:], sheet)
-            cleaned = pd.concat([head, tail], axis=0)
-        else:
-            cleaned = _remove_footer_rows(cleaned, sheet)
-
-        if len(cleaned) > 0 and not cleaned.isna().all().all():
-            all_dfs.append(cleaned)
-
-    combined = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame(columns=["_Sheet"] + TARGET_COLS)
-
-    # Attach skipped order type info as a DataFrame attribute for caller to inspect
-    combined.attrs["skipped_order_types"] = skipped_order_types
-    return combined
-
-
-# ======================
-# Pivot 生成
-# ======================
-
-def _coerce_numeric_series(s: pd.Series) -> pd.Series:
-    """将混合类型序列尽可能转为数值（用于 Pivot 计算）。
-
-    背景：部分 OSR 导出的 Excel 中，`Order Qty` 列会被错误套用“日期格式”，
-    pandas 读取后会变成 `datetime`（例如 1900-01-03）。
-    若直接 `pd.to_numeric` 会变成 NaN，导致透视表该月份全部为 0。
-
-    处理策略：
-    - datetime / Timestamp：转换回 Excel serial number（openpyxl 的 to_excel）
-    - date：按 00:00:00 组合成 datetime 再转 serial
-    - time：换算为一天的比例（Excel 对时间的存储方式）
-    - 字符串：去掉逗号、空格、括号负数等常见格式后再 to_numeric
-    """
-    if s is None:
-        return pd.Series(dtype="float64")
-
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_numeric(s, errors="coerce")
-
-    ser = s.copy()
-
-    if pd.api.types.is_datetime64_any_dtype(ser):
-        out = ser.map(lambda x: to_excel(pd.Timestamp(x).to_pydatetime()) if pd.notna(x) else None)
-        return pd.to_numeric(out, errors="coerce")
-
-    mask_dt = ser.map(lambda x: isinstance(x, (datetime, pd.Timestamp)))
-    if mask_dt.any():
-        ser.loc[mask_dt] = ser.loc[mask_dt].map(
-            lambda x: to_excel(x.to_pydatetime()) if isinstance(x, pd.Timestamp) else to_excel(x)
-        )
-
-    mask_date = ser.map(lambda x: isinstance(x, date) and not isinstance(x, datetime))
-    if mask_date.any():
-        ser.loc[mask_date] = ser.loc[mask_date].map(
-            lambda d: to_excel(datetime.combine(d, datetime.min.time()))
-        )
-
-    mask_time = ser.map(lambda x: isinstance(x, time))
-    if mask_time.any():
-        ser.loc[mask_time] = ser.loc[mask_time].map(
-            lambda t: (t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6) / 86400
-        )
-
-    mask_str = ser.map(lambda x: isinstance(x, str))
-    if mask_str.any():
-        cleaned = ser.loc[mask_str].astype(str).str.strip()
-        # Accounting-style negatives: (500) → -500
-        cleaned = cleaned.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
-        # Remove thousand separators (commas and spaces between digits)
-        cleaned = cleaned.str.replace(r",", "", regex=False)
-        # K / M / B suffixes typed by factory workers: '1.5K' → 1500
-        def _expand_suffix(v: str) -> str:
-            m = re.match(r"^([\-+]?[0-9]*\.?[0-9]+)\s*([KkMmBb])$", v.strip())
-            if m:
-                num, suffix = float(m.group(1)), m.group(2).upper()
-                multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix]
-                return str(int(num * multiplier))
-            return v
-        cleaned = cleaned.map(_expand_suffix)
-        # Strip anything that isn't numeric after above conversions
-        cleaned = cleaned.str.replace(r"[^0-9eE\.\+\-]", "", regex=True)
-        ser.loc[mask_str] = cleaned
-
-    return pd.to_numeric(ser, errors="coerce")
-
-
-def generate_pivot_tables(
-    df: pd.DataFrame,
-    *,
-    value_col: str = "Order Qty",
-    report_date: str,
-    customer: str,
-    date_basis: str = DATE_BASIS_DEFAULT,
-) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
-    if len(df) == 0:
-        return {}, []
-
-    df = df.copy()
-    if value_col not in df.columns:
-        df[value_col] = 0
-
-    df[value_col] = _coerce_numeric_series(df[value_col]).fillna(0)
-    
-    # Determine date column based on date_basis parameter
-    date_col = DATE_BASIS_COLUMN_MAP.get(date_basis, DATE_BASIS_COLUMN_MAP[DATE_BASIS_DEFAULT])
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    
-    # Validate: ensure the chosen date column has valid dates
-    valid_dates = df[date_col].dropna()
-    if len(valid_dates) == 0:
-        raise ReportError(
-            f"所选日期列「{date_col}」没有有效日期数据。"
-            f"请检查源数据或选择另一个日期基准。"
-        )
-    
-    df["MonthLabel"] = df[date_col].dt.strftime("%b-%y")
-
-    df["Order Type"] = df["Order Type"].replace({"FR": "Forecast-FR"})
-
-    # Clamp the date range used for month-column generation to a reasonable window.
-    # A single corrupt cell (e.g. Excel serial mis-read as year 2173) would otherwise
-    # generate thousands of columns, causing a memory spike or crash.
-    # Rows with out-of-range dates still appear in the pivot (their MonthLabel is NaT
-    # and they aggregate to 0 for every month column, which is correct).
-    _today = pd.Timestamp.now()
-    _clamp_min = pd.Timestamp(_today.year - 3, 1, 1)   # 3 years back
-    _clamp_max = pd.Timestamp(_today.year + 6, 12, 31)  # 6 years forward
-
-    valid_dates = df[date_col].dropna()
-    valid_dates_clamped = valid_dates[(valid_dates >= _clamp_min) & (valid_dates <= _clamp_max)]
-
-    if len(valid_dates_clamped) == 0:
-        # All dates are out of range - fall back to unclamped (handles far-future reports)
-        valid_dates_clamped = valid_dates
-
-    clamped_out = len(valid_dates) - len(valid_dates_clamped)
-    if clamped_out > 0:
-        import warnings
-        warnings.warn(
-            f"{clamped_out} date values in '{date_col}' are outside the expected range "
-            f"({_clamp_min.year}-{_clamp_max.year}) and will not generate month columns. "
-            f"These rows are still included in totals where their month falls within the range."
-        )
-
-    min_date = valid_dates_clamped.min()
-    max_date = valid_dates_clamped.max()
-    if pd.notna(min_date) and pd.notna(max_date):
-        start = min_date.to_period("M").to_timestamp()
-        end = max_date.to_period("M").to_timestamp()
-        all_months = pd.date_range(start, end, freq="MS").strftime("%b-%y").tolist()
-    else:
-        all_months = []
-
-    product_types = sorted(df["Product Type"].dropna().unique())
-    result: Dict[str, pd.DataFrame] = {}
-
-    # 输出列顺序要求：Order Type 紧挨在 Team 的左侧
-    base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
-
-    for pt in product_types:
-        sub_df = df[df["Product Type"] == pt].copy()
-        if len(sub_df) == 0:
-            continue
-
-        pivot = pd.pivot_table(
-            sub_df,
-            values=value_col,
-            index=["Factory", "Team", "Order Type"],
-            columns="MonthLabel",
-            aggfunc="sum",
-            fill_value=0,
-        )
-        pivot = pivot.reindex(columns=all_months, fill_value=0).reset_index()
-
-        # 调整三大维度列顺序：Factory, Order Type, Team
-        pivot = pivot.reindex(
-            columns=["Factory", "Order Type", "Team"]
-            + [c for c in pivot.columns if c not in {"Factory", "Team", "Order Type"}]
-        )
-
-        pivot["Customer"] = customer
-        pivot["Product Type"] = pt
-        pivot["Date"] = report_date
-
-        # Dynamically detect years from month columns (e.g., "Jan-25" -> 2025)
-        year_suffixes = sorted(set(
-            m.split("-")[1] for m in all_months if "-" in m
-        ))
-        year_ttl_cols = []
-        for ys in year_suffixes:
-            year_full = f"20{ys}"
-            month_cols_for_year = [c for c in all_months if str(c).endswith(f"-{ys}")]
-            col_name = f"{year_full} Ttl"
-            pivot[col_name] = pivot[month_cols_for_year].sum(axis=1) if month_cols_for_year else 0
-            year_ttl_cols.append(col_name)
-        
-        pivot["Ttl"] = pivot[year_ttl_cols].sum(axis=1) if year_ttl_cols else 0
-
-        pivot["__sort_key"] = pivot["Order Type"].map(ORDER_TYPE_SORT_ORDER).fillna(999)
-        pivot = pivot.sort_values(by=["Factory", "Team", "__sort_key"], ascending=[True, True, True])
-        pivot = pivot.drop(columns=["__sort_key"])
-
-        final_cols = base_cols + all_months + year_ttl_cols + ["Ttl"]
-        pivot = pivot[[c for c in final_cols if c in pivot.columns]]
-        result[pt] = pivot
-
-    # 修剪：去掉全为 0 的前后月份
-    if all_months and result:
-        zero_months = {
-            m
-            for m in all_months
-            if all(p.get(m, pd.Series([0])).sum() == 0 for p in result.values())
-        }
-        first_idx = 0
-        while first_idx < len(all_months) and all_months[first_idx] in zero_months:
-            first_idx += 1
-        last_idx = len(all_months) - 1
-        while last_idx >= first_idx and all_months[last_idx] in zero_months:
-            last_idx -= 1
-        trimmed_months = all_months[first_idx : last_idx + 1] if first_idx <= last_idx else []
-    else:
-        trimmed_months = []
-
-    for pt, pivot in list(result.items()):
-        cols_to_drop = set(all_months) - set(trimmed_months)
-        pivot = pivot.drop(columns=cols_to_drop, errors="ignore")
-
-        # Recalculate dynamic year totals after trimming
-        year_suffixes = sorted(set(
-            m.split("-")[1] for m in trimmed_months if "-" in m
-        ))
-        year_ttl_cols = []
-        for ys in year_suffixes:
-            year_full = f"20{ys}"
-            month_cols_for_year = [c for c in trimmed_months if str(c).endswith(f"-{ys}")]
-            col_name = f"{year_full} Ttl"
-            pivot[col_name] = pivot[month_cols_for_year].sum(axis=1) if month_cols_for_year else 0
-            year_ttl_cols.append(col_name)
-        
-        pivot["Ttl"] = pivot[year_ttl_cols].sum(axis=1) if year_ttl_cols else 0
-
-        result[pt] = pivot
-
-    return result, trimmed_months
-
-
-# ======================
-# Excel 输出
-# ======================
-def _format_headers_in_range(ws, header_row: int, num_cols: int):
-    orange_fill = PatternFill(start_color="FF8C00", end_color="FF8C00", fill_type="solid")
-    light_blue_fill = PatternFill(start_color="87CEEB", end_color="87CEEB", fill_type="solid")
-    for col_idx in range(1, num_cols + 1):
-        cell = ws.cell(row=header_row, column=col_idx)
-        col_name = cell.value
-        cell.fill = orange_fill if col_name == "Factory" else light_blue_fill
-
-
-def _sanitize_table_name(name: str) -> str:
-    """Sanitize table name to Excel rules."""
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", str(name))
-    if sanitized and sanitized[0].isdigit():
-        sanitized = "T_" + sanitized
-    if len(sanitized) > 255:
-        sanitized = sanitized[:255]
-    if not sanitized:
-        sanitized = "Table1"
-    return sanitized
-
-
-def _get_unique_table_name(ws, base_name: str) -> str:
-    base_sanitized = _sanitize_table_name(base_name)
-    existing_names = set()
-
-    if hasattr(ws, "tables") and ws.tables:
-        existing_names.update(ws.tables.keys())
-
-    if hasattr(ws, "parent") and ws.parent:
-        for sheet in ws.parent.worksheets:
-            if hasattr(sheet, "tables") and sheet.tables:
-                existing_names.update(sheet.tables.keys())
-
-    candidate = base_sanitized
-    counter = 1
-    while candidate in existing_names:
-        suffix = f"_{counter}"
-        max_base_len = 255 - len(suffix)
-        candidate = base_sanitized[:max_base_len] + suffix
-        counter += 1
-
-    return candidate
-
-
-def _write_table_block(
-    ws,
-    df: pd.DataFrame,
-    title_text: str,
-    start_row: int,
-    report_date: str,
-    factory_name: str,
-    table_name: str,
-    total_team_label: str = "Total",
-    total_product_type_label: str = "ALL",
-    allowed_filter_columns: Optional[List[str]] = None,
-    highlight_columns: Optional[List[str]] = None,
-) -> int:
-    """写入一个表块（标题 + 表头 + 数据 + Total 行），返回下一可用行。"""
-    if df.empty:
-        return start_row
-
-    current_row = start_row
-    num_cols = len(df.columns)
-    end_col_letter = get_column_letter(num_cols)
-
-    # Title row
-    ws.merge_cells(f"A{current_row}:{end_col_letter}{current_row}")
-    title_cell = ws.cell(row=current_row, column=1, value=title_text)
-    title_cell.font = Font(bold=True, size=16)
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    title_cell.fill = PatternFill("solid", fgColor="DDEBF7")
-    ws.row_dimensions[current_row].height = 30
-    current_row += 1
-
-    # Header row
-    header_row = current_row
-    ws.append(list(df.columns))
-    for c_idx in range(1, num_cols + 1):
-        ws.cell(row=header_row, column=c_idx).font = Font(bold=True)
-    _format_headers_in_range(ws, header_row, num_cols)
-
-    # Optional: highlight some columns (header)
-    highlight_cols = [c for c in (highlight_columns or []) if c in df.columns]
-    highlight_col_idx = [df.columns.get_loc(c) + 1 for c in highlight_cols]
-    highlight_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-    for col_idx in highlight_col_idx:
-        ws.cell(row=header_row, column=col_idx).fill = highlight_fill
-
-    current_row += 1
-
-    # Data rows
-    data_start_row = current_row
-    for row in dataframe_to_rows(df, index=False, header=False):
-        ws.append(row)
-    last_data_row = data_start_row + len(df) - 1
-    current_row = last_data_row + 1
-
-    # Optional: highlight some columns (data rows)
-    if highlight_col_idx:
-        for r in range(data_start_row, last_data_row + 1):
-            for col_idx in highlight_col_idx:
-                ws.cell(row=r, column=col_idx).fill = highlight_fill
-
-    # Create Excel Table for header + data rows only (excludes Total row)
-    table_ref = f"A{header_row}:{end_col_letter}{last_data_row}"
-    unique_table_name = _get_unique_table_name(ws, table_name)
-
-    table = Table(displayName=unique_table_name, ref=table_ref)
-    table.tableStyleInfo = TableStyleInfo(
-        name="TableStyleLight1",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=False,
-        showColumnStripes=False,
-    )
-
-    # Configure AutoFilter: show filter dropdowns only on allowed columns
-    table.autoFilter = AutoFilter(ref=table_ref)
-
-    headers = list(df.columns)
-    allowed = set(allowed_filter_columns or ["Order Type"])
-    allowed_colIds = {headers.index(c) for c in allowed if c in headers}
-
-    # Hide filter buttons for all columns EXCEPT allowed columns
-    table.autoFilter.filterColumn = [
-        FilterColumn(colId=colId, hiddenButton=True)
-        for colId in range(len(headers))
-        if colId not in allowed_colIds
-    ]
-
-    ws.add_table(table)
-
-    # Total row (SUBTOTAL formulas)
-    total_row_num = current_row
-
-    # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date
-    base_cols = ["Factory", "Order Type", "Team", "Customer", "Product Type", "Date"]
-    
-    # Detect year total columns dynamically (e.g., "2024 Ttl", "2025 Ttl", "2026 Ttl", "2027 Ttl")
-    year_ttl_cols = [c for c in df.columns if c.endswith(" Ttl") and c != "Ttl"]
-    
-    actual_month_cols = [
-        c
-        for c in df.columns
-        if c not in base_cols and c not in set(year_ttl_cols) and c != "Ttl"
-    ]
-
-    for c_idx, col_name in enumerate(df.columns, start=1):
-        cell = ws.cell(row=total_row_num, column=c_idx)
-        cell.font = Font(bold=True)
-
-        if col_name in base_cols:
-            if col_name == "Factory":
-                cell.value = factory_name
-            elif col_name == "Customer":
-                cell.value = (
-                    df["Customer"].iloc[0]
-                    if "Customer" in df.columns and len(df) > 0
-                    else CUSTOMER_LABEL_DEFAULT
-                )
-            elif col_name == "Team":
-                cell.value = total_team_label
-            elif col_name == "Product Type":
-                cell.value = total_product_type_label
-            elif col_name == "Date":
-                cell.value = report_date
-            elif col_name == "Order Type":
-                cell.value = "Total"
-
-        elif col_name in actual_month_cols or col_name in year_ttl_cols or col_name == "Ttl":
-            col_letter = get_column_letter(c_idx)
-            cell.value = f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{last_data_row})"
-
-        else:
-            cell.value = 0
-
-    # Optional: highlight some columns (total row)
-    if highlight_col_idx:
-        for col_idx in highlight_col_idx:
-            ws.cell(row=total_row_num, column=col_idx).fill = highlight_fill
-
-    current_row += 1
-    return current_row
-
-
-def _build_order_type_summary_df(
-    factory_all_df: pd.DataFrame,
-    *,
-    report_date: str,
-    factory_name: str,
-) -> pd.DataFrame:
-    """按 Order Type 汇总（不含 Team/Customer/Product Type）用于每个 sheet 的首表。
-
-    目标样式参考邮件截图：
-    - 列：Factory | Order Type | Date | (Months...) | 2025 Ttl | 2026 Ttl | Ttl
-    - 行：SO / AO / Forecast-FR + (Total 行由 Excel SUBTOTAL 公式生成)
-    """
-
-    if factory_all_df is None or factory_all_df.empty:
-        return pd.DataFrame()
-
-    # 明细表固定列（其余列视为月份列）
-    detail_base_cols = {"Factory", "Order Type", "Team", "Customer", "Product Type", "Date"}
-    
-    # Dynamically detect year total columns (e.g., "2024 Ttl", "2025 Ttl", "2026 Ttl", "2027 Ttl")
-    year_ttl_cols = [c for c in factory_all_df.columns if c.endswith(" Ttl") and c != "Ttl"]
-    ttl_cols = year_ttl_cols + (["Ttl"] if "Ttl" in factory_all_df.columns else [])
-    
-    month_cols = [
-        c
-        for c in factory_all_df.columns
-        if c not in detail_base_cols and c not in set(ttl_cols)
-    ]
-
-    numeric_cols = month_cols + ttl_cols
-
-    # groupby 前先保证数值列可求和
-    work = factory_all_df.copy()
-    for c in numeric_cols:
-        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
-
-    grouped = (
-        work.groupby(["Factory", "Order Type"], as_index=False)[numeric_cols]
-        .sum()
-        .copy()
-    )
-
-    # 确保 3 个 Order Type 都存在（若缺失则补 0）
-    wanted_order_types = ["SO", "AO", "Forecast-FR"]
-    rows: List[Dict[str, Any]] = []
-    for ot in wanted_order_types:
-        sub = grouped[grouped["Order Type"] == ot]
-        if sub.empty:
-            row: Dict[str, Any] = {"Factory": factory_name, "Order Type": ot}
-            for c in numeric_cols:
-                row[c] = 0
-            rows.append(row)
-        else:
-            rows.append(sub.iloc[0].to_dict())
-
-    summary = pd.DataFrame(rows)
-    summary["Date"] = report_date
-
-    ordered_cols = ["Factory", "Order Type", "Date"] + month_cols + ttl_cols
-    ordered_cols = [c for c in ordered_cols if c in summary.columns]
-    return summary[ordered_cols]
-
-
-def _write_factory_sheet_no_table(
-    ws,
-    factory_name: str,
-    pivot_tables: Dict[str, pd.DataFrame],
-    report_date: str,
-    metric_label: str,
-) -> bool:
-    """每个 Factory sheet：
-
-    结构：
-    1) 顶部：Order Type 汇总表（不含 Team/Customer/Product Type）——邮件截图要求
-    2) 其次：ALL DATA 明细表（All Teams + Product Types）
-    3) 下方：按 **Team -> Product Type** 拆分多个小表（同 Team 聚在一起）
-    """
-
-    # Build consolidated DataFrame for this factory
-    parts: List[pd.DataFrame] = []
-    for product_type in sorted(pivot_tables.keys()):
-        pivot_df = pivot_tables[product_type]
-        if pivot_df is None or pivot_df.empty:
-            continue
-        sub = pivot_df[pivot_df["Factory"] == factory_name].copy()
-        if not sub.empty:
-            parts.append(sub)
-
-    if not parts:
-        return False
-
-    factory_all_df = pd.concat(parts, ignore_index=True)
-
-    # Sort for readability (Team -> Product Type -> Order Type)
-    if "Order Type" in factory_all_df.columns:
-        factory_all_df["__sort_key"] = factory_all_df["Order Type"].map(ORDER_TYPE_SORT_ORDER).fillna(999)
-
-        sort_cols: List[str] = []
-        for c in ("Team", "Product Type", "__sort_key"):
-            if c in factory_all_df.columns:
-                sort_cols.append(c)
-
-        if sort_cols:
-            factory_all_df = factory_all_df.sort_values(by=sort_cols, ascending=True)
-
-        factory_all_df = factory_all_df.drop(columns=["__sort_key"], errors="ignore").reset_index(drop=True)
-
-    current_row = 1
-    table_counter = 1
-    safe_factory = _sanitize_table_name(factory_name)
-
-    # ----------------------
-    # NEW: Summary by Order Type (no Team/Customer/Product Type)
-    # ----------------------
-    summary_df = _build_order_type_summary_df(
-        factory_all_df,
-        report_date=report_date,
-        factory_name=factory_name,
-    )
-
-    if not summary_df.empty:
-        # 标题按截图：Factory — ALL --- Metric (All Teams + Product Types)
-        title_text = f"{factory_name} — ALL --- {metric_label} (All Teams + Product Types)"
-        table_name = f"T_{safe_factory}_SUMMARY_{table_counter}"
-        table_counter += 1
-
-        current_row = _write_table_block(
-            ws,
-            summary_df,
-            title_text,
-            current_row,
-            report_date,
-            factory_name,
-            table_name,
-            allowed_filter_columns=["Factory", "Order Type", "Date"],
-            highlight_columns=["Factory", "Order Type", "Date"],
-        )
-
-        current_row += 3
-
-    # ----------------------
-    # Consolidated ALL DATA
-    # ----------------------
-    if not factory_all_df.empty:
-        # 明细表（保留原有表，不删除）。为了避免与 Summary 标题混淆，加 "Detail" 后缀
-        title_text = f"{factory_name} — ALL --- {metric_label} (All Teams + Product Types) - Detail"
-        table_name = f"T_{safe_factory}_ALL_{table_counter}"
-        table_counter += 1
-
-        current_row = _write_table_block(
-            ws,
-            factory_all_df,
-            title_text,
-            current_row,
-            report_date,
-            factory_name,
-            table_name,
-            total_team_label="Total",
-            total_product_type_label="ALL",
-            allowed_filter_columns=["Team", "Order Type", "Product Type"],
-        )
-
-        current_row += 3
-
-    # ----------------------
-    # Split tables (Team -> Product Type)
-    # ----------------------
-    team_to_parts: Dict[str, List[Tuple[str, pd.DataFrame]]] = {}
-
-    for product_type in sorted(pivot_tables.keys()):
-        pivot_df = pivot_tables[product_type]
-        if pivot_df is None or pivot_df.empty:
-            continue
-
-        factory_pt_df = pivot_df[pivot_df["Factory"] == factory_name].copy()
-        if factory_pt_df.empty:
-            continue
-
-        team_series = factory_pt_df["Team"].fillna("").astype(str)
-        for team in pd.unique(team_series):
-            team_df = factory_pt_df.loc[team_series == team].copy()
-            if team_df.empty:
-                continue
-            team_to_parts.setdefault(team, []).append((product_type, team_df))
-
-    team_order = {
-        "Sports": 0,
-        "Fancy": 1,
-        "SW": 2,
-        "Cotton Panty": 3,
-        "Brands-COS": 4,
-        "Brands-Stories": 5,
-    }
-
-    def _team_sort_key(t: str):
-        t_clean = str(t).strip()
-        if not t_clean:
-            return (2, 999, "")
-        if t_clean in team_order:
-            return (0, team_order[t_clean], t_clean)
-        return (1, 999, t_clean)
-
-    for team in sorted(team_to_parts.keys(), key=_team_sort_key):
-        parts_list = team_to_parts[team]
-        parts_list_sorted = sorted(parts_list, key=lambda x: str(x[0]))
-
-        for product_type, team_df in parts_list_sorted:
-            team_title = team if str(team).strip() else "（空）"
-            # 标题遵循 NEW 的格式：Factory — Team --- Product Type (Metric)
-            title_text = f"{factory_name} — {team_title} --- {product_type} ({metric_label})"
-
-            safe_team = _sanitize_table_name(str(team))
-            safe_pt = _sanitize_table_name(str(product_type))
-            table_name = f"T_{safe_factory}_{safe_team}_{safe_pt}_{table_counter}"
-            table_counter += 1
-
-            current_row = _write_table_block(
-                ws,
-                team_df,
-                title_text,
-                current_row,
-                report_date,
-                factory_name,
-                table_name,
-                total_team_label="Total",
-                total_product_type_label=product_type,
-            )
-
-            current_row += 3
-
-    # ----------------------
-    # Column widths
-    # ----------------------
-    max_col = max(ws.max_column, 1)
-    # 输出列顺序：Factory, Order Type, Team, Customer, Product Type, Date, ...
-    for col_idx in range(1, max_col + 1):
-        if col_idx == 1:  # Factory
-            ws.column_dimensions[get_column_letter(col_idx)].width = 12
-        elif col_idx == 2:  # Order Type
-            ws.column_dimensions[get_column_letter(col_idx)].width = 14
-        elif col_idx == 3:  # Team
-            ws.column_dimensions[get_column_letter(col_idx)].width = 22
-        elif col_idx in (4, 5, 6):  # Customer / Product Type / Date
-            ws.column_dimensions[get_column_letter(col_idx)].width = 14
-        else:
-            ws.column_dimensions[get_column_letter(col_idx)].width = 11
-
-    return True
-
-
-# ======================
-# 工作表名称安全处理
-# ======================
-_SHEET_INVALID_CHARS_RE = re.compile(r"[:\\/?*\[\]]")
-
-
-def _safe_sheet_name(wb, desired: str) -> str:
-    name = _SHEET_INVALID_CHARS_RE.sub("_", str(desired)).strip()
-    name = name[:31].rstrip()
-    if not name:
-        name = "Sheet1"
-
-    base = name
-    i = 2
-    while name in wb.sheetnames:
-        suffix = f" ({i})"
-        max_len = 31 - len(suffix)
-        name = (base[:max_len].rstrip()) + suffix
-        i += 1
-    return name
-
-
-def _write_workbook_no_table(writer, pivot_tables: Dict[str, pd.DataFrame], report_date: str, metric_label: str):
-    all_factories = set()
-    for pt_df in pivot_tables.values():
-        all_factories.update(pt_df["Factory"].dropna().unique())
-
-    for factory in sorted(all_factories):
-        factory_str = str(factory)
-        desired_name = f"{factory_str} - {metric_label}"
-        safe_name = _safe_sheet_name(writer.book, desired_name)
-        ws = writer.book.create_sheet(safe_name)
-        has_data = _write_factory_sheet_no_table(ws, factory_str, pivot_tables, report_date, metric_label)
-        if not has_data:
-            writer.book.remove(ws)
-
-
-def _safe_remove(path: str, retries: int = 12, delay_s: float = 0.15) -> None:
-    for _ in range(retries):
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%b-%y")
+
+    # Excel serial dates sometimes arrive as numbers
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        if 20000 <= float(value) <= 80000:
+            ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(value), unit="D")
+            return ts.strftime("%b-%y")
+
+    text = _normalize_text(value)
+    if not text:
+        return None
+
+    # Direct month label already
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.notna(ts):
+        return ts.strftime("%b-%y")
+
+    compact = re.sub(r"\s+", "", text)
+    for fmt in ("%Y-%m", "%Y/%m", "%Y%m"):
         try:
-            os.remove(path)
-            return
-        except FileNotFoundError:
-            return
-        except PermissionError:
-            time_mod.sleep(delay_s)
-    try:
-        os.remove(path)
-    except Exception:
-        pass
+            ts = pd.to_datetime(compact, format=fmt)
+            return ts.strftime("%b-%y")
+        except Exception:
+            pass
+    return None
 
 
-def pivot_report_multi_to_xlsx_bytes_no_table(
-    pivot_tables_by_metric: Dict[str, Dict[str, pd.DataFrame]],
-    report_date: str,
-) -> bytes:
-    """生成一个 Excel（包含多个指标的多个 sheet），返回 bytes。"""
-    fd, temp_path = tempfile.mkstemp(suffix=".xlsx")
-    os.close(fd)
-
-    try:
-        with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-            for metric_label, pivot_tables in pivot_tables_by_metric.items():
-                _write_workbook_no_table(writer, pivot_tables, report_date, metric_label)
-
-            wb = writer.book
-            # 确保公式（SUBTOTAL 等）在打开时自动重算
-            try:
-                wb.calculation.calcMode = "auto"
-                wb.calculation.fullCalcOnLoad = True
-                wb.calculation.forceFullCalc = True
-            except Exception:
-                pass
-
-            if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
-                ws0 = wb["Sheet"]
-                if ws0.max_row == 1 and ws0.max_column == 1 and ws0["A1"].value is None:
-                    wb.remove(ws0)
-
-        with open(temp_path, "rb") as f:
-            return f.read()
-
-    finally:
-        _safe_remove(temp_path)
+def _month_from_year_month(year_value: object, month_value: object) -> Optional[str]:
+    year = pd.to_numeric(pd.Series([year_value]), errors="coerce").iloc[0]
+    month = pd.to_numeric(pd.Series([month_value]), errors="coerce").iloc[0]
+    if pd.isna(year) or pd.isna(month):
+        return None
+    year = int(year)
+    month = int(month)
+    if not (1 <= month <= 12):
+        return None
+    return pd.Timestamp(year=year, month=month, day=1).strftime("%b-%y")
 
 
-# ======================
-# 高层封装：从上传文件 bytes 生成报表
-# ======================
-def generate_pivot_report_from_upload(
-    excel_bytes: bytes,
+def _month_sort_key(label: str) -> Tuple[int, int]:
+    ts = pd.to_datetime(label, format="%b-%y", errors="coerce")
+    if pd.notna(ts):
+        return (ts.year, ts.month)
+    return (9999, 99)
+
+
+def _normalize_team(value: object) -> str:
+    text = _normalize_text(value)
+    lowered = text.lower()
+    if not lowered:
+        return "ALL"
+    if "fancy" in lowered:
+        return "Fancy"
+    if "sports" in lowered or "legging" in lowered:
+        return "Sports"
+    if lowered.startswith("sw") or lowered == "sw" or "sw-" in lowered or "sw " in lowered:
+        return "SW"
+    if "brands" in lowered or "cos" in lowered:
+        return "Brands-COS"
+    if "cotton" in lowered and "panty" in lowered:
+        return "Cotton Panty"
+    return text
+
+
+def _normalize_product_type(value: object) -> str:
+    text = _normalize_text(value)
+    if not text:
+        return "OTHERS"
+    return text.upper()
+
+
+def _classify_so_order_type(raw_value: object) -> str:
+    lowered = _normalize_text(raw_value).lower()
+    if lowered in {"ao", "annual order"}:
+        return "AO"
+    if "forecast" in lowered or lowered in {"fr", "forecast-fr", "forecast fr"}:
+        return "Forecast-FR"
+    # Meeting rule: Normal order / Speed order and other SO-like subtypes belong to SO
+    return "SO"
+
+
+def _classify_aofr_order_type(raw_value: object) -> str:
+    lowered = _normalize_text(raw_value).lower()
+    if not lowered:
+        return "AO"
+    if "fr" in lowered or "forecast" in lowered:
+        return "Forecast-FR"
+    return "AO"
+
+
+def _derive_month(
+    df: pd.DataFrame,
     *,
-    filename: str,
-    scan_rows: int = SCAN_ROWS_DEFAULT,
-    customer_label: str = CUSTOMER_LABEL_DEFAULT,
-    report_date: Optional[str] = None,
-    date_basis: str = DATE_BASIS_DEFAULT,
-) -> Tuple[bytes, Dict[str, Any]]:
-    """从上传的 Excel bytes 生成 pivot 报表。
-
-    Args:
-        excel_bytes: Excel 文件内容
-        filename: 文件名
-        scan_rows: 扫描行数
-        customer_label: Customer 字段值
-        report_date: 报表日期
-        date_basis: 日期基准 ("ex_fty" 或 "customer_delivery")
-
-    Returns:
-        (pivot_xlsx_bytes, stats)
-
-    stats:
-        rows_used: int
-        factories: List[str]
-        product_types: List[str]
-        months: Dict[str, List[str]]  # metric -> months
-        report_date: str
-        date_basis: str
-    """
-    if report_date is None:
-        report_date = datetime.now().strftime("%b-%d")
-
-    if not filename:
-        raise ReportError("缺少文件名。")
-
-    ext = os.path.splitext(filename)[1].lower()
-
-    warnings_text: str = ""
-
-    try:
-        if ext != ".xls":
-            excel_io = io.BytesIO(excel_bytes)
-            with pd.ExcelFile(excel_io, engine="openpyxl") as xls:
-                ok, expl = sanity_check(xls, scan_rows=scan_rows)
-                if not ok:
-                    raise ReportError(expl)
-
-                warnings_text = expl or ""
-
-                combined_df = process_excel(xls, scan_rows=scan_rows)
-
+    date_basis: str,
+    ex_fty_date_col: Optional[str],
+    ex_fty_year_col: Optional[str],
+    ex_fty_month_col: Optional[str],
+    customer_date_col: Optional[str],
+    customer_year_col: Optional[str],
+    customer_month_col: Optional[str],
+) -> pd.Series:
+    labels: List[Optional[str]] = []
+    for _, row in df.iterrows():
+        if date_basis == DATE_BASIS_CUSTOMER:
+            label = None
+            if customer_date_col:
+                label = _parse_month_label(row[customer_date_col])
+            if label is None and customer_year_col and customer_month_col:
+                label = _month_from_year_month(row[customer_year_col], row[customer_month_col])
         else:
-            # .xls：需要 xlrd
-            try:
-                import xlrd  # noqa: F401
-            except Exception:
-                raise ReportError("当前环境未安装 xlrd，无法读取 .xls。请安装 xlrd==2.0.1 或将文件另存为 .xlsx。")
+            label = None
+            if ex_fty_date_col:
+                label = _parse_month_label(row[ex_fty_date_col])
+            if label is None and ex_fty_year_col and ex_fty_month_col:
+                label = _month_from_year_month(row[ex_fty_year_col], row[ex_fty_month_col])
+        labels.append(label)
+    return pd.Series(labels, index=df.index)
 
-            fd, tmp_xls = tempfile.mkstemp(suffix=".xls")
-            os.close(fd)
-            try:
-                with open(tmp_xls, "wb") as f:
-                    f.write(excel_bytes)
-                with pd.ExcelFile(tmp_xls, engine="xlrd") as xls:
-                    ok, expl = sanity_check(xls, scan_rows=scan_rows)
-                    if not ok:
-                        raise ReportError(expl)
 
-                    warnings_text = expl or ""
-                    combined_df = process_excel(xls, scan_rows=scan_rows)
-            finally:
-                _safe_remove(tmp_xls)
+def _prepare_so_sheet(df: pd.DataFrame, date_basis: str) -> Tuple[pd.DataFrame, List[str]]:
+    factory_col = _find_column(df, ["Factory"])
+    team_col = _find_column(df, ["Team"], required=False)
+    product_type_col = _find_column(df, ["Product Type"])
+    order_type_col = _find_column(df, ["Order Type"])
+    order_qty_col = _find_column(df, ["Order Qty"])
+    sah_col = _find_column(df, ["SAH"])
+    sales_col = _find_column(df, ["Sales (USD)", "Sales USD"])
 
-    except ReportError:
-        raise
-    except Exception as e:
-        raise ReportError(f"无法读取 Excel 文件：{e}")
+    ex_fty_date_col = _find_column(df, ["Requested Garment Delivery (DeadLine ex-fty)", "Requested Garment Delivery"], required=False)
+    ex_fty_year_col = _find_column(df, ["Ex-fty Year", "Ex Fty Year"], required=False)
+    ex_fty_month_col = _find_column(df, ["Ex-fty Month", "Ex Fty Month"], required=False)
+    customer_date_col = _find_column(df, ["Customer Delivery Date"], required=False)
+    customer_year_col = _find_column(df, ["TOD Year", "TOD  Year"], required=False)
+    customer_month_col = _find_column(df, ["TOD Month"], required=False)
 
-    if len(combined_df) == 0:
-        raise ReportError("清洗后没有找到可用数据行，请检查 Excel 格式是否符合要求。")
+    out = pd.DataFrame()
+    out["Factory"] = df[factory_col].map(_normalize_text)
+    out["Team"] = df[team_col].map(_normalize_team) if team_col else "ALL"
+    out["Customer"] = "ALL"
+    out["Product Type"] = df[product_type_col].map(_normalize_product_type)
+    out["Raw Order Type"] = df[order_type_col].map(_normalize_text)
+    out["Order Type"] = df[order_type_col].map(_classify_so_order_type)
+    out["Month"] = _derive_month(
+        df,
+        date_basis=date_basis,
+        ex_fty_date_col=ex_fty_date_col,
+        ex_fty_year_col=ex_fty_year_col,
+        ex_fty_month_col=ex_fty_month_col,
+        customer_date_col=customer_date_col,
+        customer_year_col=customer_year_col,
+        customer_month_col=customer_month_col,
+    )
+    out["Order Qty"] = _clean_numeric(df[order_qty_col])
+    out["SAH"] = _clean_numeric(df[sah_col])
+    out["Sales (USD)"] = _clean_numeric(df[sales_col])
+    out["Source Sheet"] = "SO"
+    warnings: List[str] = []
+    return out, warnings
 
-    # Generate pivot tables for each metric
-    pivot_tables_by_metric: Dict[str, Dict[str, pd.DataFrame]] = {}
-    month_cols_by_metric: Dict[str, List[str]] = {}
 
-    for metric_label, metric_col in METRIC_SPECS:
-        pivot_tables, month_cols = generate_pivot_tables(
-            combined_df,
-            value_col=metric_col,
-            report_date=report_date,
-            customer=customer_label,
-            date_basis=date_basis,
-        )
-        if not pivot_tables:
-            raise ReportError(f"未能生成透视表（{metric_label}），请检查该列是否存在有效值。")
-        pivot_tables_by_metric[metric_label] = pivot_tables
-        month_cols_by_metric[metric_label] = month_cols
+def _prepare_aofr_sheet(df: pd.DataFrame, date_basis: str) -> Tuple[pd.DataFrame, List[str]]:
+    factory_col = _find_column(df, ["Factory"])
+    team_col = _find_column(df, ["Team"], required=False)
+    product_type_col = _find_column(df, ["Product Type"])
+    order_type_col = _pick_best_aofr_order_type_col(df)
+    order_qty_col = _find_column(df, ["Order Qty"])
+    sah_col = _find_column(df, ["SAH"])
+    sales_col = _find_column(df, ["Sales (USD)", " Sales (USD)", "Sales USD"])
 
-    pivot_bytes = pivot_report_multi_to_xlsx_bytes_no_table(pivot_tables_by_metric, report_date)
+    ex_fty_date_col = _find_column(df, ["Request Garment Delivery (DeadLine ex-fty)", "Requested Garment Delivery (DeadLine ex-fty)", "Requested Garment Delivery"], required=False)
+    ex_fty_year_col = _find_column(df, ["Ex-fty Year", "Ex Fty Year"], required=False)
+    ex_fty_month_col = _find_column(df, ["Ex-fty Month", "Ex Fty Month"], required=False)
+    customer_date_col = _find_column(df, ["Customer Delivery Date"], required=False)
+    customer_year_col = _find_column(df, ["TOD Year", "TOD  Year"], required=False)
+    customer_month_col = _find_column(df, ["TOD Month"], required=False)
 
-    # Get the actual date column name used
-    date_col_used = DATE_BASIS_COLUMN_MAP.get(date_basis, DATE_BASIS_COLUMN_MAP[DATE_BASIS_DEFAULT])
+    out = pd.DataFrame()
+    out["Factory"] = df[factory_col].map(_normalize_text)
+    out["Team"] = df[team_col].map(_normalize_team) if team_col else "ALL"
+    out["Customer"] = "ALL"
+    out["Product Type"] = df[product_type_col].map(_normalize_product_type)
+    out["Raw Order Type"] = df[order_type_col].map(_normalize_text)
+    out["Order Type"] = df[order_type_col].map(_classify_aofr_order_type)
+    out["Month"] = _derive_month(
+        df,
+        date_basis=date_basis,
+        ex_fty_date_col=ex_fty_date_col,
+        ex_fty_year_col=ex_fty_year_col,
+        ex_fty_month_col=ex_fty_month_col,
+        customer_date_col=customer_date_col,
+        customer_year_col=customer_year_col,
+        customer_month_col=customer_month_col,
+    )
+    out["Order Qty"] = _clean_numeric(df[order_qty_col])
+    out["SAH"] = _clean_numeric(df[sah_col])
+    out["Sales (USD)"] = _clean_numeric(df[sales_col])
+    out["Source Sheet"] = "AOFR"
+    warnings: List[str] = []
+    return out, warnings
 
-    # Build human-readable warning for skipped order types
-    skipped = combined_df.attrs.get("skipped_order_types", {})
-    skipped_warning = ""
-    if skipped:
-        lines = ", ".join(f"\"{k}\" ({v} rows)" for k, v in sorted(skipped.items()))
-        skipped_warning = (
-            f"⚠️ The following Order Type values in AOFR/FR sheets were not recognised "
-            f"and were excluded from the pivot: {lines}.\n"
-            f"Only 'AO' and 'FR' (plus FR-prefixed variants) are included."
-        )
-    combined_warnings = "\n".join(filter(None, [warnings_text, skipped_warning]))
 
+def _build_normalized_frame(excel_bytes: bytes, date_basis: str) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    warnings: List[str] = []
+
+    so_df = _read_sheet(excel_bytes, "SO")
+    aofr_df = _read_sheet(excel_bytes, "AOFR")
+
+    so_norm, so_warnings = _prepare_so_sheet(so_df, date_basis)
+    aofr_norm, aofr_warnings = _prepare_aofr_sheet(aofr_df, date_basis)
+    warnings.extend(so_warnings)
+    warnings.extend(aofr_warnings)
+
+    frame = pd.concat([so_norm, aofr_norm], ignore_index=True)
+    frame = frame[frame["Factory"].isin(FACTORY_ORDER)].copy()
+    frame = frame[frame["Month"].notna()].copy()
+    frame = frame[(frame["Order Qty"] != 0) | (frame["SAH"] != 0) | (frame["Sales (USD)"] != 0)].copy()
+
+    if frame.empty:
+        raise ReportError("没有可用于生成报表的数据。请检查工作簿内容和日期基准。")
+
+    month_columns = sorted(frame["Month"].dropna().unique().tolist(), key=_month_sort_key)
     stats = {
-        "report_date": report_date,
-        "warnings": combined_warnings,
-        "rows_used": int(len(combined_df)),
-        "factories": sorted(combined_df["Factory"].dropna().astype(str).unique().tolist()),
-        "product_types": sorted(combined_df["Product Type"].dropna().astype(str).unique().tolist()),
-        "months": month_cols_by_metric,
-        "date_basis": date_basis,
-        "date_column": date_col_used,
+        "rows_used": int(len(frame)),
+        "factories": [fac for fac in FACTORY_ORDER if fac in frame["Factory"].unique().tolist()],
+        "product_types": sorted(frame["Product Type"].dropna().unique().tolist()),
+        "month_columns": month_columns,
+        "warnings_list": warnings,
     }
+    return frame, stats
 
-    return pivot_bytes, stats
+
+def _report_date_label(report_date: Optional[str]) -> str:
+    if report_date:
+        ts = pd.to_datetime(report_date, errors="coerce")
+        if pd.notna(ts):
+            return ts.strftime("%b-%d")
+        return str(report_date)
+    return pd.Timestamp.today().strftime("%b-%d")
+
+
+def _order_type_sort_key(value: str) -> int:
+    try:
+        return SUMMARY_ORDER_TYPES.index(value)
+    except ValueError:
+        return len(SUMMARY_ORDER_TYPES)
+
+
+def _write_block(ws, df: pd.DataFrame, start_row: int, start_col: int = 1, header_fill: str = "D9EAF7") -> int:
+    fill = PatternFill(fill_type="solid", fgColor=header_fill)
+    header_font = Font(bold=True)
+    header_align = Alignment(horizontal="center", vertical="center")
+    cell_align = Alignment(vertical="center")
+    for r_idx, row in enumerate([df.columns.tolist(), *df.values.tolist()], start=0):
+        rr = start_row + r_idx
+        for c_idx, value in enumerate(row, start=0):
+            cell = ws.cell(row=rr, column=start_col + c_idx, value=value)
+            if r_idx == 0:
+                cell.fill = fill
+                cell.font = header_font
+                cell.alignment = header_align
+            else:
+                cell.alignment = cell_align
+    return start_row + len(df) + 1
+
+
+def _write_summary(ws, frame: pd.DataFrame, factory: str, metric: str, month_columns: List[str], report_date: str) -> int:
+    subset = frame[frame["Factory"] == factory]
+    pivot = subset.pivot_table(index="Order Type", columns="Month", values=metric, aggfunc="sum", fill_value=0)
+    pivot = pivot.reindex(index=SUMMARY_ORDER_TYPES, fill_value=0)
+    pivot = pivot.reindex(columns=month_columns, fill_value=0)
+    pivot = pivot.reset_index()
+    pivot.insert(0, "Factory", factory)
+    pivot.insert(2, "Date", report_date)
+
+    next_row = _write_block(ws, pivot, start_row=3)
+    total_row = next_row
+    ws.cell(row=total_row, column=1, value="Total").font = Font(bold=True)
+    for col_idx in range(4, 4 + len(month_columns)):
+        col_letter = get_column_letter(col_idx)
+        formula = f"=SUBTOTAL(109,{col_letter}4:{col_letter}{total_row-1})"
+        ws.cell(row=total_row, column=col_idx, value=formula).font = Font(bold=True)
+    return total_row
+
+
+def _write_detail(ws, frame: pd.DataFrame, factory: str, metric: str, month_columns: List[str], report_date: str, start_row: int) -> None:
+    subset = frame[frame["Factory"] == factory].copy()
+    detail = subset.pivot_table(
+        index=["Factory", "Order Type", "Team", "Customer", "Product Type"],
+        columns="Month",
+        values=metric,
+        aggfunc="sum",
+        fill_value=0,
+    ).reset_index()
+    if detail.empty:
+        detail = pd.DataFrame(columns=["Factory", "Order Type", "Team", "Customer", "Product Type", "Date", *month_columns])
+    else:
+        detail.insert(5, "Date", report_date)
+        detail = detail.reindex(columns=["Factory", "Order Type", "Team", "Customer", "Product Type", "Date", *month_columns], fill_value=0)
+        detail = detail.sort_values(
+            by=["Order Type", "Team", "Product Type"],
+            key=lambda s: s.map(_order_type_sort_key) if s.name == "Order Type" else s,
+            kind="stable",
+        ).reset_index(drop=True)
+
+    ws.cell(row=start_row, column=1, value="Detail").font = Font(bold=True)
+    data_start = start_row + 2
+    next_row = _write_block(ws, detail, start_row=data_start)
+    if not detail.empty:
+        header_row = data_start
+        last_data_row = next_row - 1
+        last_col = get_column_letter(6 + len(month_columns))
+        ws.auto_filter.ref = f"A{header_row}:{last_col}{last_data_row}"
+        total_row = next_row
+        ws.cell(row=total_row, column=1, value="Total").font = Font(bold=True)
+        # Date col is F, month cols start G
+        for col_idx in range(7, 7 + len(month_columns)):
+            col_letter = get_column_letter(col_idx)
+            formula = f"=SUBTOTAL(109,{col_letter}{header_row+1}:{col_letter}{last_data_row})"
+            ws.cell(row=total_row, column=col_idx, value=formula).font = Font(bold=True)
+
+
+def _auto_fit(ws) -> None:
+    widths: Dict[int, int] = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            value = str(cell.value)
+            widths[cell.column] = max(widths.get(cell.column, 0), min(len(value) + 2, 40))
+    for idx, width in widths.items():
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+
+def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[str]) -> bytes:
+    wb = Workbook()
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcMode = "auto"
+
+    factories = [fac for fac in FACTORY_ORDER if fac in frame["Factory"].unique().tolist()]
+    for metric in METRICS:
+        for factory in factories:
+            ws = wb.create_sheet(f"{factory} - {metric}"[:31])
+            ws.freeze_panes = "A3"
+            ws.cell(row=1, column=1, value=f"{factory} — ALL — {metric}").font = Font(bold=True)
+            summary_total_row = _write_summary(ws, frame, factory, metric, month_columns, report_date)
+            _write_detail(ws, frame, factory, metric, month_columns, report_date, start_row=summary_total_row + 2)
+            _auto_fit(ws)
+
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
+def generate_pivot_report_from_upload(
+    *,
+    excel_bytes: bytes,
+    filename: Optional[str] = None,
+    report_date: Optional[str] = None,
+    date_basis: str = DATE_BASIS_EX_FTY,
+) -> Tuple[bytes, Dict[str, object]]:
+    if not excel_bytes:
+        raise ReportError("上传文件为空。")
+    if date_basis not in DATE_BASIS_COLUMN_MAP:
+        raise ReportError(f"不支持的日期基准：{date_basis!r}")
+
+    frame, stats = _build_normalized_frame(excel_bytes, date_basis)
+    report_date_label = _report_date_label(report_date)
+    workbook_bytes = _render_workbook(frame, report_date_label, stats["month_columns"])
+
+    warnings_text = ""
+    if stats["warnings_list"]:
+        warnings_text = "\n".join(dict.fromkeys(str(x) for x in stats["warnings_list"] if str(x).strip()))
+
+    result_stats = {
+        "rows_used": stats["rows_used"],
+        "factories": stats["factories"],
+        "product_types": stats["product_types"],
+        "report_date": report_date_label,
+        "date_column": DATE_BASIS_COLUMN_MAP[date_basis],
+        "warnings": warnings_text,
+        "filename": filename or "pivot_report.xlsx",
+    }
+    return workbook_bytes, result_stats
+
+
+# Optional convenience aliases.
+generate_report_from_upload = generate_pivot_report_from_upload
+build_pivot_report_from_upload = generate_pivot_report_from_upload
+
+__all__ = [
+    "DATE_BASIS_EX_FTY",
+    "DATE_BASIS_CUSTOMER",
+    "DATE_BASIS_COLUMN_MAP",
+    "ReportError",
+    "ReportConfig",
+    "generate_pivot_report_from_upload",
+    "generate_report_from_upload",
+    "build_pivot_report_from_upload",
+]
