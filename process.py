@@ -10,6 +10,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 DATE_BASIS_EX_FTY = "ex_fty"
 DATE_BASIS_CUSTOMER = "customer"
@@ -29,7 +30,7 @@ TEAM_SECTION_ORDER: List[str] = [
     "SW",
     "Brands-COS",
     "Cotton Panty",
-    "legging Reservation",
+    "Legging Reservation",
 ]
 PRODUCT_SECTION_ORDER: List[str] = ["BOTTOM", "BRA", "OTHERS", "PANTIES", "TOP"]
 
@@ -206,7 +207,7 @@ def _normalize_team(value: object) -> str:
     if not lowered:
         return "ALL"
     if "legging reservation" in lowered:
-        return "legging Reservation"
+        return "Legging Reservation"
     if "fancy" in lowered:
         return "Fancy"
     if "sports-legging" in lowered or lowered == "sports":
@@ -385,7 +386,8 @@ def _build_normalized_frame(excel_bytes: bytes, date_basis: str) -> Tuple[pd.Dat
     frame = pd.concat([so_norm, aofr_norm], ignore_index=True)
     frame = frame[frame["Factory"].isin(FACTORY_ORDER)].copy()
     frame = frame[frame["Month"].notna()].copy()
-    frame = frame[(frame["Order Qty"] != 0) | (frame["SAH"] != 0) | (frame["Sales (USD)"] != 0)].copy()
+    # Keep zero-value rows so previously visible team/product sections remain present in the output.
+    # This preserves the older workbook layout more closely; summary totals are unaffected because zeros sum to zero.
 
     if frame.empty:
         raise ReportError("没有可用于生成报表的数据。请检查工作簿内容和日期基准。")
@@ -569,6 +571,32 @@ def _section_candidates(frame: pd.DataFrame, factory: str) -> List[Tuple[str, st
     return list(subset[["Team", "Product Type"]].itertuples(index=False, name=None))
 
 
+
+def _safe_table_name(*parts: object) -> str:
+    raw = "_".join(_normalize_text(part) for part in parts if _normalize_text(part))
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_")
+    if not cleaned:
+        cleaned = "TABLE"
+    if not cleaned[0].isalpha():
+        cleaned = f"T_{cleaned}"
+    return cleaned[:200]
+
+
+def _add_excel_table(ws, *, start_row: int, end_row: int, end_col: int, display_name: str) -> None:
+    if end_row <= start_row:
+        return
+    ref = f"A{start_row}:{get_column_letter(end_col)}{end_row}"
+    table = Table(displayName=display_name, ref=ref)
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleLight1",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=False,
+        showColumnStripes=False,
+    )
+    ws.add_table(table)
+
+
 def _auto_fit(ws) -> None:
     widths: Dict[int, int] = {}
     for row in ws.iter_rows():
@@ -590,6 +618,7 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
     wb.calculation.calcMode = "auto"
 
     factories = [fac for fac in FACTORY_ORDER if fac in frame["Factory"].unique().tolist()]
+    table_counter = 1
     for metric in METRICS:
         for factory in factories:
             ws = wb.create_sheet(f"{factory} - {metric}"[:31])
@@ -597,7 +626,16 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
             # Summary block
             ws.cell(row=1, column=1, value=f"{factory} — ALL --- {metric} (All Teams + Product Types)").font = Font(bold=True)
             summary_df, summary_numeric_headers = _build_summary_df(frame, factory, metric, month_columns, report_date)
-            summary_last_data_row = _write_dataframe_rows(ws, 2, summary_df)
+            summary_header_row = 2
+            summary_last_data_row = _write_dataframe_rows(ws, summary_header_row, summary_df)
+            _add_excel_table(
+                ws,
+                start_row=summary_header_row,
+                end_row=summary_last_data_row,
+                end_col=3 + len(summary_numeric_headers),
+                display_name=_safe_table_name('T', factory, 'SUMMARY', table_counter),
+            )
+            table_counter += 1
             summary_total_row = summary_last_data_row + 1
             _write_subtotal_row(
                 ws,
@@ -605,7 +643,7 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                 [factory, "Total", report_date],
                 first_numeric_col=4,
                 last_numeric_col=3 + len(summary_numeric_headers),
-                data_start_row=3,
+                data_start_row=summary_header_row + 1,
                 data_end_row=summary_last_data_row,
             )
 
@@ -615,6 +653,15 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
             detail_df, detail_numeric_headers = _build_all_detail_df(frame, factory, metric, month_columns, report_date)
             detail_header_row = detail_title_row + 1
             detail_last_data_row = _write_dataframe_rows(ws, detail_header_row, detail_df)
+            if not detail_df.empty:
+                _add_excel_table(
+                    ws,
+                    start_row=detail_header_row,
+                    end_row=detail_last_data_row,
+                    end_col=6 + len(detail_numeric_headers),
+                    display_name=_safe_table_name('T', factory, 'ALL', table_counter),
+                )
+                table_counter += 1
             detail_total_row = detail_last_data_row + 1
             if detail_df.empty:
                 _write_row(ws, detail_total_row, [factory, "Total", "Total", "ALL", "ALL", report_date], header=False)
@@ -638,6 +685,14 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                 ws.cell(row=next_title_row, column=1, value=f"{factory} — {team} --- {product_type} ({metric})").font = Font(bold=True)
                 section_header_row = next_title_row + 1
                 section_last_data_row = _write_dataframe_rows(ws, section_header_row, section_df)
+                _add_excel_table(
+                    ws,
+                    start_row=section_header_row,
+                    end_row=section_last_data_row,
+                    end_col=6 + len(section_numeric_headers),
+                    display_name=_safe_table_name('T', factory, team, product_type, table_counter),
+                )
+                table_counter += 1
                 section_total_row = section_last_data_row + 1
                 _write_subtotal_row(
                     ws,
@@ -650,7 +705,7 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                 )
                 next_title_row = section_total_row + 4
 
-            ws.freeze_panes = "A2"
+            ws.freeze_panes = None
             _auto_fit(ws)
 
     output = BytesIO()
@@ -659,7 +714,6 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
 
 
 def generate_pivot_report_from_upload(
-    *,
     excel_bytes: bytes,
     filename: Optional[str] = None,
     report_date: Optional[str] = None,
@@ -688,3 +742,19 @@ def generate_pivot_report_from_upload(
         "filename": filename or "pivot_report.xlsx",
     }
     return workbook_bytes, result_stats
+
+
+# Optional convenience aliases for the current upstream repo.
+generate_report_from_upload = generate_pivot_report_from_upload
+build_pivot_report_from_upload = generate_pivot_report_from_upload
+
+__all__ = [
+    "DATE_BASIS_EX_FTY",
+    "DATE_BASIS_CUSTOMER",
+    "DATE_BASIS_COLUMN_MAP",
+    "ReportError",
+    "ReportConfig",
+    "generate_pivot_report_from_upload",
+    "generate_report_from_upload",
+    "build_pivot_report_from_upload",
+]
