@@ -129,7 +129,11 @@ def _pick_best_aofr_order_type_col(df: pd.DataFrame) -> str:
         score = sum(
             1
             for value in values
-            if any(token in _normalize_text(value).lower() for token in ("ao", "forecast", "fr", "close"))
+            if (
+                _is_pure_ao_order_type(_normalize_order_type_label(value))
+                or _is_forecast_order_type(_normalize_order_type_label(value))
+                or _is_closed_like_order_type(_normalize_order_type_label(value))
+            )
         )
         if score > best_score:
             best_score = score
@@ -230,27 +234,98 @@ def _normalize_product_type(value: object) -> str:
     return text.upper()
 
 
-def _classify_so_order_type(raw_value: object) -> str:
+def _normalize_order_type_label(raw_value: object) -> str:
     lowered = _normalize_text(raw_value).lower()
     lowered = re.sub(r"[_-]+", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
-    if lowered in {"ao", "annual order", "ao close", "ao-close"} or lowered.startswith("ao "):
-        return "AO"
-    if "forecast" in lowered or lowered in {"fr", "forecast fr", "forecast-fr"}:
-        return "Forecast-FR"
-    # Meeting rule: Normal order / Speed order and other SO-like subtypes belong to SO
-    return "SO"
+    return lowered
 
 
-def _classify_aofr_order_type(raw_value: object) -> str:
-    lowered = _normalize_text(raw_value).lower()
-    lowered = re.sub(r"[_-]+", " ", lowered)
-    lowered = re.sub(r"\s+", " ", lowered).strip()
+def _is_closed_like_order_type(lowered: str) -> bool:
     if not lowered:
+        return False
+    return bool(set(lowered.split()) & {"close", "closed"})
+
+
+def _is_forecast_order_type(lowered: str) -> bool:
+    if not lowered:
+        return False
+    tokens = set(lowered.split())
+    return "forecast" in tokens or "forecast" in lowered or "fr" in tokens or lowered.startswith("fr ")
+
+
+def _is_pure_ao_order_type(lowered: str) -> bool:
+    return lowered in {"ao", "annual order"}
+
+
+def _is_so_like_order_type(lowered: str) -> bool:
+    if not lowered:
+        return False
+    return lowered.startswith("normal order") or lowered.startswith("speed order")
+
+
+def _build_order_type_warnings(
+    raw_order_type: pd.Series,
+    classified_order_type: pd.Series,
+    *,
+    source_sheet: str,
+) -> List[str]:
+    raw_text = raw_order_type.map(_normalize_text)
+    normalized = raw_order_type.map(_normalize_order_type_label)
+
+    excluded_closed = sorted(
+        raw_text[
+            classified_order_type.isna()
+            & raw_text.ne("")
+            & normalized.map(_is_closed_like_order_type)
+        ].dropna().unique().tolist()
+    )
+    unknown = sorted(
+        raw_text[
+            classified_order_type.isna()
+            & raw_text.ne("")
+            & ~normalized.map(_is_closed_like_order_type)
+        ].dropna().unique().tolist()
+    )
+
+    warnings: List[str] = []
+    if excluded_closed:
+        warnings.append(
+            f"{source_sheet}: excluded closed-like Order Type values: {', '.join(excluded_closed)}"
+        )
+    if unknown:
+        warnings.append(
+            f"{source_sheet}: skipped unmapped Order Type values: {', '.join(unknown)}"
+        )
+    return warnings
+
+
+def _classify_so_order_type(raw_value: object) -> Optional[str]:
+    lowered = _normalize_order_type_label(raw_value)
+    if not lowered:
+        return None
+    if _is_closed_like_order_type(lowered):
+        return None
+    if _is_pure_ao_order_type(lowered):
         return "AO"
-    if "forecast" in lowered or lowered in {"fr", "forecast fr", "forecast-fr"}:
+    if _is_forecast_order_type(lowered):
         return "Forecast-FR"
-    return "AO"
+    if _is_so_like_order_type(lowered):
+        return "SO"
+    return None
+
+
+def _classify_aofr_order_type(raw_value: object) -> Optional[str]:
+    lowered = _normalize_order_type_label(raw_value)
+    if not lowered:
+        return None
+    if _is_closed_like_order_type(lowered):
+        return None
+    if _is_pure_ao_order_type(lowered):
+        return "AO"
+    if _is_forecast_order_type(lowered):
+        return "Forecast-FR"
+    return None
 
 
 def _derive_month(
@@ -323,7 +398,7 @@ def _prepare_so_sheet(df: pd.DataFrame, date_basis: str) -> Tuple[pd.DataFrame, 
     out["SAH"] = _clean_numeric(df[sah_col])
     out["Sales (USD)"] = _clean_numeric(df[sales_col])
     out["Source Sheet"] = "SO"
-    warnings: List[str] = []
+    warnings = _build_order_type_warnings(df[order_type_col], out["Order Type"], source_sheet="SO")
     return out, warnings
 
 
@@ -368,7 +443,7 @@ def _prepare_aofr_sheet(df: pd.DataFrame, date_basis: str) -> Tuple[pd.DataFrame
     out["SAH"] = _clean_numeric(df[sah_col])
     out["Sales (USD)"] = _clean_numeric(df[sales_col])
     out["Source Sheet"] = "AOFR"
-    warnings: List[str] = []
+    warnings = _build_order_type_warnings(df[order_type_col], out["Order Type"], source_sheet="AOFR")
     return out, warnings
 
 
@@ -386,6 +461,7 @@ def _build_normalized_frame(excel_bytes: bytes, date_basis: str) -> Tuple[pd.Dat
     frame = pd.concat([so_norm, aofr_norm], ignore_index=True)
     frame = frame[frame["Factory"].isin(FACTORY_ORDER)].copy()
     frame = frame[frame["Month"].notna()].copy()
+    frame = frame[frame["Order Type"].isin(SUMMARY_ORDER_TYPES)].copy()
     # Keep zero-value rows so previously visible team/product sections remain present in the output.
     # This preserves the older workbook layout more closely; summary totals are unaffected because zeros sum to zero.
 
