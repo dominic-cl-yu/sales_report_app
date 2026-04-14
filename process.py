@@ -1,15 +1,16 @@
-
 from __future__ import annotations
 
 import re
+from datetime import date, datetime, time
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 DATE_BASIS_EX_FTY = "ex_fty"
@@ -60,15 +61,48 @@ def _normalize_key(value: object) -> str:
 
 
 def _clean_numeric(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="float64")
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce").fillna(0)
-    cleaned = (
-        series.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("$", "", regex=False)
-        .str.strip()
-    )
-    cleaned = cleaned.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaT": pd.NA})
+
+    cleaned = series.copy()
+
+    if pd.api.types.is_datetime64_any_dtype(cleaned):
+        out = cleaned.map(
+            lambda value: to_excel(pd.Timestamp(value).to_pydatetime()) if pd.notna(value) else None
+        )
+        return pd.to_numeric(out, errors="coerce").fillna(0)
+
+    mask_dt = cleaned.map(lambda value: isinstance(value, (datetime, pd.Timestamp)))
+    if mask_dt.any():
+        cleaned.loc[mask_dt] = cleaned.loc[mask_dt].map(
+            lambda value: to_excel(value.to_pydatetime()) if isinstance(value, pd.Timestamp) else to_excel(value)
+        )
+
+    mask_date = cleaned.map(lambda value: isinstance(value, date) and not isinstance(value, datetime))
+    if mask_date.any():
+        cleaned.loc[mask_date] = cleaned.loc[mask_date].map(
+            lambda value: to_excel(datetime.combine(value, datetime.min.time()))
+        )
+
+    mask_time = cleaned.map(lambda value: isinstance(value, time))
+    if mask_time.any():
+        cleaned.loc[mask_time] = cleaned.loc[mask_time].map(
+            lambda value: (
+                value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1e6
+            ) / 86400
+        )
+
+    mask_str = cleaned.map(lambda value: isinstance(value, str))
+    if mask_str.any():
+        normalized = cleaned.loc[mask_str].astype(str).str.strip()
+        normalized = normalized.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+        normalized = normalized.str.replace(",", "", regex=False)
+        normalized = normalized.str.replace("$", "", regex=False)
+        normalized = normalized.str.replace(r"[^0-9eE\.\+\-]", "", regex=True)
+        cleaned.loc[mask_str] = normalized
+
     return pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
 
@@ -116,6 +150,36 @@ def _find_column(df: pd.DataFrame, aliases: Sequence[str], *, required: bool = T
             f"Available columns: {list(df.columns)}"
         )
     return None
+
+
+def _normalize_order_type_label(raw_value: object) -> str:
+    lowered = _normalize_text(raw_value).lower()
+    lowered = re.sub(r"[_-]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def _is_closed_like_order_type(lowered: str) -> bool:
+    if not lowered:
+        return False
+    return bool(set(lowered.split()) & {"close", "closed"})
+
+
+# Critical business rule:
+# only pure FR should be counted into Forecast-FR.
+# Examples that must NOT be counted: FR-low priority, FR-Closed.
+def _is_forecast_order_type(lowered: str) -> bool:
+    return lowered == "fr"
+
+
+def _is_pure_ao_order_type(lowered: str) -> bool:
+    return lowered in {"ao", "annual order"}
+
+
+def _is_so_like_order_type(lowered: str) -> bool:
+    if not lowered:
+        return False
+    return lowered.startswith("normal order") or lowered.startswith("speed order")
 
 
 def _pick_best_aofr_order_type_col(df: pd.DataFrame) -> str:
@@ -186,7 +250,7 @@ def _month_from_year_month(year_value: object, month_value: object) -> Optional[
 def _month_sort_key(label: str) -> Tuple[int, int]:
     ts = pd.to_datetime(label, format="%b-%y", errors="coerce")
     if pd.notna(ts):
-        return (ts.year, ts.month)
+        return (int(ts.year), int(ts.month))
     return (9999, 99)
 
 
@@ -232,36 +296,6 @@ def _normalize_product_type(value: object) -> str:
     if not text:
         return "OTHERS"
     return text.upper()
-
-
-def _normalize_order_type_label(raw_value: object) -> str:
-    lowered = _normalize_text(raw_value).lower()
-    lowered = re.sub(r"[_-]+", " ", lowered)
-    lowered = re.sub(r"\s+", " ", lowered).strip()
-    return lowered
-
-
-def _is_closed_like_order_type(lowered: str) -> bool:
-    if not lowered:
-        return False
-    return bool(set(lowered.split()) & {"close", "closed"})
-
-
-def _is_forecast_order_type(lowered: str) -> bool:
-    if not lowered:
-        return False
-    tokens = set(lowered.split())
-    return "forecast" in tokens or "forecast" in lowered or "fr" in tokens or lowered.startswith("fr ")
-
-
-def _is_pure_ao_order_type(lowered: str) -> bool:
-    return lowered in {"ao", "annual order"}
-
-
-def _is_so_like_order_type(lowered: str) -> bool:
-    if not lowered:
-        return False
-    return lowered.startswith("normal order") or lowered.startswith("speed order")
 
 
 def _build_order_type_warnings(
@@ -312,7 +346,7 @@ def _classify_so_order_type(raw_value: object) -> Optional[str]:
         return "Forecast-FR"
     if _is_so_like_order_type(lowered):
         return "SO"
-    return None
+    return "SO"
 
 
 def _classify_aofr_order_type(raw_value: object) -> Optional[str]:
@@ -368,7 +402,11 @@ def _prepare_so_sheet(df: pd.DataFrame, date_basis: str) -> Tuple[pd.DataFrame, 
 
     ex_fty_date_col = _find_column(
         df,
-        ["Requested Garment Delivery (DeadLine ex-fty)", "Requested Garment Delivery", "Request Garment Delivery (DeadLine ex-fty)"],
+        [
+            "Requested Garment Delivery (DeadLine ex-fty)",
+            "Requested Garment Delivery",
+            "Request Garment Delivery (DeadLine ex-fty)",
+        ],
         required=False,
     )
     ex_fty_year_col = _find_column(df, ["Ex-fty Year", "Ex Fty Year"], required=False)
@@ -413,7 +451,11 @@ def _prepare_aofr_sheet(df: pd.DataFrame, date_basis: str) -> Tuple[pd.DataFrame
 
     ex_fty_date_col = _find_column(
         df,
-        ["Request Garment Delivery (DeadLine ex-fty)", "Requested Garment Delivery (DeadLine ex-fty)", "Requested Garment Delivery"],
+        [
+            "Request Garment Delivery (DeadLine ex-fty)",
+            "Requested Garment Delivery (DeadLine ex-fty)",
+            "Requested Garment Delivery",
+        ],
         required=False,
     )
     ex_fty_year_col = _find_column(df, ["Ex-fty Year", "Ex Fty Year"], required=False)
@@ -462,13 +504,13 @@ def _build_normalized_frame(excel_bytes: bytes, date_basis: str) -> Tuple[pd.Dat
     frame = frame[frame["Factory"].isin(FACTORY_ORDER)].copy()
     frame = frame[frame["Month"].notna()].copy()
     frame = frame[frame["Order Type"].isin(SUMMARY_ORDER_TYPES)].copy()
-    # Keep zero-value rows so previously visible team/product sections remain present in the output.
-    # This preserves the older workbook layout more closely; summary totals are unaffected because zeros sum to zero.
 
     if frame.empty:
         raise ReportError("没有可用于生成报表的数据。请检查工作簿内容和日期基准。")
 
-    month_columns = _continuous_month_columns(sorted(frame["Month"].dropna().unique().tolist(), key=_month_sort_key))
+    month_columns = _continuous_month_columns(
+        sorted(frame["Month"].dropna().unique().tolist(), key=_month_sort_key)
+    )
     stats = {
         "rows_used": int(len(frame)),
         "factories": [fac for fac in FACTORY_ORDER if fac in frame["Factory"].unique().tolist()],
@@ -568,7 +610,11 @@ def _write_subtotal_row(
     _write_row(ws, row_idx, list(label_values), header=False)
     for col_idx in range(first_numeric_col, last_numeric_col + 1):
         col_letter = get_column_letter(col_idx)
-        ws.cell(row=row_idx, column=col_idx, value=f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{data_end_row})").font = Font(bold=True)
+        ws.cell(
+            row=row_idx,
+            column=col_idx,
+            value=f"=SUBTOTAL(109,{col_letter}{data_start_row}:{col_letter}{data_end_row})",
+        ).font = Font(bold=True)
     for col_idx in range(1, first_numeric_col):
         ws.cell(row=row_idx, column=col_idx).font = Font(bold=True)
 
@@ -581,8 +627,9 @@ def _build_summary_df(frame: pd.DataFrame, factory: str, metric: str, month_colu
     pivot = pivot.reset_index()
     pivot.insert(0, "Factory", factory)
     pivot.insert(2, "Date", report_date)
-    numeric = pivot[month_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
-    pivot.loc[:, month_columns] = numeric
+    if month_columns:
+        numeric = pivot[month_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
+        pivot.loc[:, month_columns] = numeric
     pivot, numeric_headers = _append_year_totals(pivot, month_columns)
     ordered_cols = ["Factory", "Order Type", "Date", *numeric_headers]
     pivot = pivot.reindex(columns=ordered_cols)
@@ -602,13 +649,16 @@ def _build_all_detail_df(frame: pd.DataFrame, factory: str, metric: str, month_c
         detail = pd.DataFrame(columns=["Factory", "Order Type", "Team", "Customer", "Product Type", "Date", *month_columns])
     else:
         detail.insert(5, "Date", report_date)
-        detail = detail.reindex(columns=["Factory", "Order Type", "Team", "Customer", "Product Type", "Date", *month_columns], fill_value=0)
+        detail = detail.reindex(
+            columns=["Factory", "Order Type", "Team", "Customer", "Product Type", "Date", *month_columns],
+            fill_value=0,
+        )
         detail = detail.sort_values(
             by=["Team", "Product Type", "Order Type"],
-            key=lambda s: s.map(dict((t, i) for i, t in enumerate(TEAM_SECTION_ORDER))) if s.name == "Team"
-                else s.map(dict((p, i) for i, p in enumerate(PRODUCT_SECTION_ORDER))) if s.name == "Product Type"
-                else s.map(_order_type_sort_key) if s.name == "Order Type"
-                else s,
+            key=lambda s: s.map({t: i for i, t in enumerate(TEAM_SECTION_ORDER)}) if s.name == "Team"
+            else s.map({p: i for i, p in enumerate(PRODUCT_SECTION_ORDER)}) if s.name == "Product Type"
+            else s.map(_order_type_sort_key) if s.name == "Order Type"
+            else s,
             kind="stable",
         ).reset_index(drop=True)
     detail, numeric_headers = _append_year_totals(detail, month_columns)
@@ -617,7 +667,15 @@ def _build_all_detail_df(frame: pd.DataFrame, factory: str, metric: str, month_c
     return detail, numeric_headers
 
 
-def _build_section_df(frame: pd.DataFrame, factory: str, team: str, product_type: str, metric: str, month_columns: List[str], report_date: str) -> Tuple[pd.DataFrame, List[str]]:
+def _build_section_df(
+    frame: pd.DataFrame,
+    factory: str,
+    team: str,
+    product_type: str,
+    metric: str,
+    month_columns: List[str],
+    report_date: str,
+) -> Tuple[pd.DataFrame, List[str]]:
     subset = frame[(frame["Factory"] == factory) & (frame["Team"] == team) & (frame["Product Type"] == product_type)].copy()
     pivot = subset.pivot_table(index="Order Type", columns="Month", values=metric, aggfunc="sum", fill_value=0)
     pivot = pivot.reindex(columns=month_columns, fill_value=0)
@@ -645,7 +703,6 @@ def _section_candidates(frame: pd.DataFrame, factory: str) -> List[Tuple[str, st
     subset["_product_name"] = subset["Product Type"].map(lambda x: _product_sort_key(x)[1])
     subset = subset.sort_values(["_team_order", "_team_name", "_product_order", "_product_name"], kind="stable")
     return list(subset[["Team", "Product Type"]].itertuples(index=False, name=None))
-
 
 
 def _safe_table_name(*parts: object) -> str:
@@ -699,7 +756,6 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
         for factory in factories:
             ws = wb.create_sheet(f"{factory} - {metric}"[:31])
 
-            # Summary block
             ws.cell(row=1, column=1, value=f"{factory} — ALL --- {metric} (All Teams + Product Types)").font = Font(bold=True)
             summary_df, summary_numeric_headers = _build_summary_df(frame, factory, metric, month_columns, report_date)
             summary_header_row = 2
@@ -709,7 +765,7 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                 start_row=summary_header_row,
                 end_row=summary_last_data_row,
                 end_col=3 + len(summary_numeric_headers),
-                display_name=_safe_table_name('T', factory, 'SUMMARY', table_counter),
+                display_name=_safe_table_name("T", factory, "SUMMARY", table_counter),
             )
             table_counter += 1
             summary_total_row = summary_last_data_row + 1
@@ -723,7 +779,6 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                 data_end_row=summary_last_data_row,
             )
 
-            # All-detail block
             detail_title_row = summary_total_row + 4
             ws.cell(row=detail_title_row, column=1, value=f"{factory} — ALL --- {metric} (All Teams + Product Types) - Detail").font = Font(bold=True)
             detail_df, detail_numeric_headers = _build_all_detail_df(frame, factory, metric, month_columns, report_date)
@@ -735,7 +790,7 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                     start_row=detail_header_row,
                     end_row=detail_last_data_row,
                     end_col=6 + len(detail_numeric_headers),
-                    display_name=_safe_table_name('T', factory, 'ALL', table_counter),
+                    display_name=_safe_table_name("T", factory, "ALL", table_counter),
                 )
                 table_counter += 1
             detail_total_row = detail_last_data_row + 1
@@ -752,7 +807,6 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                     data_end_row=detail_last_data_row,
                 )
 
-            # Team/Product sections
             next_title_row = detail_total_row + 4
             for team, product_type in _section_candidates(frame, factory):
                 section_df, section_numeric_headers = _build_section_df(frame, factory, team, product_type, metric, month_columns, report_date)
@@ -766,7 +820,7 @@ def _render_workbook(frame: pd.DataFrame, report_date: str, month_columns: List[
                     start_row=section_header_row,
                     end_row=section_last_data_row,
                     end_col=6 + len(section_numeric_headers),
-                    display_name=_safe_table_name('T', factory, team, product_type, table_counter),
+                    display_name=_safe_table_name("T", factory, team, product_type, table_counter),
                 )
                 table_counter += 1
                 section_total_row = section_last_data_row + 1
